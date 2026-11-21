@@ -49,8 +49,21 @@ class KuonEngine:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         state = torch.load(checkpoint, map_location="cpu", weights_only=False)
         self.model_cfg = ModelConfig(**state["model_cfg"])
-        tokenizer_path = Path(state["train_cfg"]["data_dir"]) / "tokenizer.json"
-        self.tokenizer = BPETokenizer.load(tokenizer_path)
+        # the tokenizer lives next to the checkpoint when shipped (release
+        # asset), or in the original data dir on the training machine
+        candidates = [
+            Path(checkpoint).parent / "tokenizer.json",
+            Path(state["train_cfg"].get("data_dir", "")) / "tokenizer.json",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                self.tokenizer = BPETokenizer.load(candidate)
+                break
+        else:
+            raise FileNotFoundError(
+                "tokenizer.json not found next to the checkpoint. "
+                f"Looked in: {[str(c) for c in candidates]}. "
+                "Download it from the GitHub release into the checkpoint folder.")
         self.model = Transformer(self.model_cfg).to(self.device).eval()
         self.model.load_state_dict(state["model"])
 
