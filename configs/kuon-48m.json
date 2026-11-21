@@ -1,0 +1,31 @@
+{
+  "name": "kuon-48m",
+  "model": {
+    "vocab_size": 8192,
+    "block_size": 1024,
+    "n_layer": 10,
+    "n_embd": 640,
+    "n_head": 10,
+    "n_kv_head": 2,
+    "ffn_hidden": 1728,
+    "dropout": 0.0,
+    "tie_word_embeddings": true
+  },
+  "train": {
+    "data_dir": "data/tinystories",
+    "steps": 5000,
+    "batch_size": 16,
+    "grad_accum": 2,
+    "lr": 4e-4,
+    "min_lr": 4e-5,
+    "warmup_steps": 200,
+    "weight_decay": 0.1,
+    "eval_interval": 250,
+    "eval_batches": 20,
+    "sample_prompt": "Once upon a time",
+    "sample_tokens": 96,
+    "checkpoint_dir": "checkpoints/kuon-48m",
+    "log_file": "logs/kuon-48m.jsonl",
+    "seed": 1337
+  }
+}

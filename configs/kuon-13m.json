@@ -1,0 +1,31 @@
+{
+  "name": "kuon-13m",
+  "model": {
+    "vocab_size": 8192,
+    "block_size": 512,
+    "n_layer": 6,
+    "n_embd": 384,
+    "n_head": 6,
+    "n_kv_head": 2,
+    "ffn_hidden": 1024,
+    "dropout": 0.0,
+    "tie_word_embeddings": true
+  },
+  "train": {
+    "data_dir": "data/tinystories",
+    "steps": 2000,
+    "batch_size": 8,
+    "grad_accum": 4,
+    "lr": 6e-4,
+    "min_lr": 6e-5,
+    "warmup_steps": 100,
+    "weight_decay": 0.1,
+    "eval_interval": 100,
+    "eval_batches": 20,
+    "sample_prompt": "Once upon a time",
+    "sample_tokens": 80,
+    "checkpoint_dir": "checkpoints/kuon-13m",
+    "log_file": "logs/kuon-13m.jsonl",
+    "seed": 1337
+  }
+}
