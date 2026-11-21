@@ -125,8 +125,12 @@ class KuonAgent:
 
         sources = self._gather(question)
         if not sources:
-            # short inputs are almost always conversational ("haloooo", "p")
-            if len(question.split()) <= 3:
+            # short, non-question inputs are almost always conversational
+            # ("haloooo", "p"); real questions must admit ignorance instead
+            looks_factual = bool(re.match(
+                r"^(who|what|where|when|why|how|which|siapa|apa|kapan|dimana|di mana|berapa|mengapa|kenapa)\b",
+                question.strip(), re.I)) or question.strip().endswith("?")
+            if not looks_factual and len(question.split()) <= 3:
                 text = self.engine.complete(format_prompt(question),
                                             max_tokens=self.cfg.max_answer_tokens).strip()
                 return AgentResult(answer=text, notes="", sources=[])
