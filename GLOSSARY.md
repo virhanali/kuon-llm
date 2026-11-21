@@ -96,6 +96,14 @@ inferensi jauh lebih kecil.
 Matriks embedding dipakai ulang sebagai kepala output (lm_head) —
 hemat vocab_size × n_embd parameter, gratis tanpa penalti kualitas.
 
+**Looped model (recurrent depth)**:
+Blok transformer yang sama dijalankan beberapa kali per token —
+komputasi/kedalaman bertambah tanpa menambah parameter. Kuon memakai
+`loop_start` / `loop_end` / `loop_passes`; loop blok tengah lebih
+menguntungkan daripada blok akhir (temuan Inkling 2 Mini).
+_Hindari_: recurrent model (itu RNN)
+
+
 **KV cache**:
 Tempat menyimpan hasil hitung key/value untuk posisi-posisi yang sudah
 diproses, supaya tiap token baru saat generation cukup satu forward
@@ -150,6 +158,12 @@ _Hindari_: training (terlalu luas)
 **SFT / DPO**:
 Tahap lanjutan roadmap: SFT = belajar format instruksi/percakapan;
 DPO = belajar preferensi (mana jawaban yang lebih disukai manusia).
+
+**Chat template**:
+Format teks yang membungkus dialog sebelum masuk model. Kuon memakai
+penanda teks biasa: `User: ...\nAssistant: ...` (belum ada special token
+khusus chat). Saat SFT, loss hanya dihitung pada bagian `Assistant:`.
+
 
 ### Inference
 

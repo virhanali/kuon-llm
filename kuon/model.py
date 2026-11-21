@@ -199,6 +199,17 @@ class Transformer(nn.Module):
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 
+        # execution schedule over stored layers; looping repeats the middle
+        # block range without adding parameters (recurrent depth)
+        if cfg.looping:
+            schedule = list(range(0, cfg.loop_start))
+            for _ in range(cfg.loop_passes):
+                schedule.extend(range(cfg.loop_start, cfg.loop_end))
+            schedule.extend(range(cfg.loop_end, cfg.n_layer))
+        else:
+            schedule = list(range(cfg.n_layer))
+        self._schedule = schedule
+
         # weight init: N(0, 0.02) everywhere, except residual-out projections
         # which get N(0, 0.02/sqrt(2*n_layer)) to keep the residual stream's
         # variance from growing with depth (GPT-2/nanoGPT convention).
@@ -228,8 +239,14 @@ class Transformer(nn.Module):
         assert T <= self.cfg.block_size, f"context {T} > block_size {self.cfg.block_size}"
 
         x = self.drop(self.embed(idx))
-        for i, block in enumerate(self.blocks):
-            x = block(x, self.rope_cos, self.rope_sin, cache[i] if cache is not None else None)
+        if cache is not None and self.cfg.looping:
+            raise NotImplementedError(
+                "KV cache is not supported for looped models; "
+                "call generate() which falls back to no-cache decoding")
+        for layer_idx in self._schedule:
+            block = self.blocks[layer_idx]
+            x = block(x, self.rope_cos, self.rope_sin,
+                      cache[layer_idx] if cache is not None else None)
         x = self.norm_f(x)
         logits = self.lm_head(x)
 

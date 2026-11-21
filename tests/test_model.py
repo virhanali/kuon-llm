@@ -118,3 +118,34 @@ def test_kv_cache_greedy_matches_no_cache():
     for new in generate(model, prompt, n_new, temperature=0):
         out.append(new[0])
     assert out == ids[0, 10:].tolist()
+
+
+def test_looped_schedule_and_param_count():
+    """Looping repeats blocks without adding parameters."""
+    plain = Transformer(tiny_cfg(n_layer=3))
+    looped = Transformer(tiny_cfg(n_layer=3, loop_start=1, loop_end=2, loop_passes=2))
+    assert plain._schedule == [0, 1, 2]
+    assert looped._schedule == [0, 1, 1, 2]
+    assert sum(p.numel() for p in plain.parameters()) == sum(p.numel() for p in looped.parameters())
+
+
+def test_looped_forward_backward():
+    torch.manual_seed(0)
+    model = Transformer(tiny_cfg(n_layer=3, loop_start=0, loop_end=3, loop_passes=3))
+    idx = torch.randint(0, 97, (2, 16))
+    targets = torch.randint(0, 97, (2, 16))
+    logits, loss = model(idx, targets)
+    assert logits.shape == (2, 16, 97)
+    loss.backward()
+    assert model.blocks[1].ffn.gate_proj.weight.grad is not None
+
+
+def test_looped_generation_no_cache():
+    torch.manual_seed(0)
+    cfg = tiny_cfg(n_layer=3, loop_start=1, loop_end=2, loop_passes=2, block_size=32)
+    model = Transformer(cfg).eval()
+    prompt = torch.randint(0, 97, (1, 8))
+    ids = [new[0] for new in generate(model, prompt, max_new_tokens=5, temperature=0)]
+    assert len(ids) == 5
+    assert all(0 <= i < 97 for i in ids)
+

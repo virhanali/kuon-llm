@@ -59,6 +59,20 @@ def generate(model, prompt_ids: torch.Tensor, max_new_tokens: int = 128,
     block = cfg.block_size
     dtype = next(model.parameters()).dtype
 
+    if cfg.looping:
+        # recurrent depth: KV cache doesn't map cleanly onto repeated passes,
+        # so recompute the window each step (fine for experiments/tiny models)
+        ids = prompt_ids[:, -block:]
+        for _ in range(max_new_tokens):
+            logits, _ = model(ids)
+            nxt = sample_from_logits(logits[:, -1, :], temperature, top_k, top_p)
+            tok = nxt[:, 0].tolist()
+            yield tok
+            if eos_id is not None and tok.count(eos_id) == len(tok):
+                return
+            ids = torch.cat([ids, nxt], dim=1)[:, -block:]
+        return
+
     def fresh_caches():
         return [KVCache(prompt_ids.size(0), block, cfg.n_kv_head, cfg.head_dim,
                         dtype, device) for _ in range(cfg.n_layer)]

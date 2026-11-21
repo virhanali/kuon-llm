@@ -73,13 +73,35 @@ on a sample, then packs every document into `train.bin` / `val.bin` as
 uint16 token ids (documents separated by `<endoftext>`), memory-mapped at
 training time. Sources: `tinystories` (Hugging Face) or any text `file`.
 
+## Experiments
+
+- **[Looped Kuon](docs/experiments/looped.md)** — recurrent depth (middle
+  blocks executed multiple times, Inkling 2 Mini style). Config:
+  `configs/kuon-13m-loop.json`. Compare against the dense baseline at equal
+  tokens and at equal FLOPs.
+
+## SFT (chat)
+
+Fine-tune a pretrained checkpoint on `{user, assistant}` pairs; the loss is
+masked to the assistant turns only (`kuon/chat.py`, `kuon/sft.py`):
+
+```bash
+python scripts/prepare_sft.py --corpus corpus.txt --out data/sft --n 3000
+python scripts/sft.py --base checkpoints/kuon-13m/kuon-13m-last.pt \
+    --data data/sft --out checkpoints/kuon-13m-sft.pt --steps 300
+```
+
 ## Roadmap
 
 - [x] tokenizer, model, trainer, inference, tests — all from scratch
-- [ ] pretrain `kuon-13m` on TinyStories (CPU smoke → GPU full)
-- [ ] pretrain `kuon-48m` / `kuon-107m`
-- [ ] SFT on instruction/chat data, then preference tuning (DPO)
+- [x] pretrain `kuon-13m` on TinyStories — Kaggle T4, 2000 steps, val 2.35
+- [x] looped-transformer experiment harness + SFT pipeline (+ tests)
+- [ ] run the looped experiment and publish the comparison
+- [ ] SFT run: `kuon-13m` that answers chat prompts
+- [ ] pretrain `kuon-48m` / `kuon-107m` (Colab / Kaggle GPU)
+- [ ] preference tuning (DPO)
 - [ ] export to GGUF + llama.cpp for quantized local inference
+
 
 ## License
 
