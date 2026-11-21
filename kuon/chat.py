@@ -9,17 +9,21 @@ deliberate later step.
 from __future__ import annotations
 
 USER_PREFIX = "User: "
-ASSISTANT_PREFIX = "Assistant: "
+ASSISTANT_PREFIX = "Assistant:"
 
 
 def format_prompt(user: str) -> str:
-    """The part of the conversation the model is given (never trained on)."""
+    """The part of the conversation the model is given (never trained on).
+
+    Ends at ':' on purpose: a trailing space would tokenize differently
+    alone than when followed by the answer word (" Hello" is one chunk),
+    which breaks generation."""
     return f"{USER_PREFIX}{user.strip()}\n{ASSISTANT_PREFIX}"
 
 
 def format_example(user: str, assistant: str) -> str:
     """Full training text for one turn."""
-    return format_prompt(user) + assistant.strip()
+    return f"{format_prompt(user)} {assistant.strip()}"
 
 
 def build_example(tokenizer, user: str, assistant: str, block_size: int):

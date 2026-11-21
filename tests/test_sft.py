@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from kuon.chat import ASSISTANT_PREFIX, USER_PREFIX, build_example, format_prompt
+from kuon.chat import ASSISTANT_PREFIX, USER_PREFIX, build_example, format_example, format_prompt
 from kuon.config import ModelConfig
 from kuon.sft import sft
 from kuon.tokenizer import BPETokenizer
@@ -28,6 +28,7 @@ def test_format_and_masking():
     tok = make_tok()
     user, answer = "hello", "the cat sat on the mat."
     assert format_prompt(user) == f"{USER_PREFIX}hello\n{ASSISTANT_PREFIX}"
+    assert format_example(user, answer) == f"{USER_PREFIX}hello\n{ASSISTANT_PREFIX} the cat sat on the mat."
 
     input_ids, labels = build_example(tok, user, answer, block_size=256)
     prompt_len = len(tok.encode(format_prompt(user)))
@@ -37,7 +38,7 @@ def test_format_and_masking():
     assert all(l == -100 for l in labels[:prompt_len - 1])
     assert any(l != -100 for l in labels[prompt_len - 1:])
     # and the trainable targets decode back to the answer
-    trainable = [i for l, i in zip(labels, input_ids + [tok.eos_id]) if l != -100]
+    trainable = [l for l in labels if l != -100]
     assert tok.decode(trainable).lstrip().startswith("the cat sat")
 
 

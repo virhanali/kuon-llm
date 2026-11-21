@@ -84,4 +84,4 @@ def test_smalltalk_answers_without_search():
                       wiki_fn=lambda q, n: [Source(title="Wiki", url="", text="Halo the game.")])
     result = agent.answer("halo")
     assert result.sources == []
-    assert engine.prompts[-1] == "User: halo\nAssistant: "
+    assert engine.prompts[-1] == "User: halo\nAssistant:"
