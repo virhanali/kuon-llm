@@ -49,6 +49,7 @@ make generate        # sample text from the checkpoint
 | `kuon-13m` | ~12.6M | 512 | laptop CPU (overnight smoke runs) |
 | `kuon-48m` | ~48.4M | 1024 | free Colab / Kaggle T4 |
 | `kuon-107m` | ~107M | 1024 | Colab T4 16GB |
+| `kuon-113m` | **~113.3M** | 1024 | Kaggle T4 / Colab — GPT-1 class (vocab 16k, Cosmopedia) |
 
 Exact numbers: `python scripts/info.py --config configs/kuon-107m.json`
 

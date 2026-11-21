@@ -15,7 +15,9 @@ without ever loading the corpus into RAM.
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
 import random
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -84,3 +86,91 @@ def synthetic_docs(n_docs: int = 400, seed: int = 0):
         adj = rng.choice(_SYNTH["adj"])
         verb = rng.choice(_SYNTH["verb"])
         yield f"{name} has a {animal}. the {animal} is {adj}. they {verb} in the sun."
+
+
+# ---------------------------------------------------------------------------
+# Streaming corpus packing for large text files (Cosmopedia, books, dumps)
+# ---------------------------------------------------------------------------
+
+_PACK_TOK = None
+
+
+def _pack_init(tokenizer_path: str) -> None:
+    global _PACK_TOK
+    from kuon.tokenizer import BPETokenizer
+
+    _PACK_TOK = BPETokenizer.load(tokenizer_path)
+
+
+def _pack_encode(text: str) -> list[int]:
+    assert _PACK_TOK is not None
+    return _PACK_TOK.encode(text, add_eos=True)
+
+
+def iter_documents(path: str | Path):
+    """Yield blank-line-separated documents from a text file, streaming."""
+    doc: list[str] = []
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if line.strip():
+                doc.append(line.rstrip("\n"))
+            elif doc:
+                yield "\n".join(doc)
+                doc = []
+    if doc:
+        yield "\n".join(doc)
+
+
+def pack_corpus(input_path: str | Path, tokenizer_path: str | Path, out_dir: str | Path,
+                val_docs: int = 500, workers: int = 2, max_tokens: int | None = None,
+                verbose: bool = True) -> dict:
+    """Stream a large text file into train.bin / val.bin (+ tokenizer + meta).
+
+    Documents are blank-line separated; the first `val_docs` documents become
+    validation. `max_tokens` caps the TRAIN token count. RAM stays flat.
+    """
+    from kuon.tokenizer import BPETokenizer
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    shutil.copy(tokenizer_path, out / "tokenizer.json")
+    tokenizer = BPETokenizer.load(tokenizer_path)
+
+    train_writer = BinWriter(out / "train.bin")
+    val_writer = BinWriter(out / "val.bin")
+    pool = None
+    n_docs = 0
+    try:
+        if workers > 1:
+            pool = mp.Pool(workers, initializer=_pack_init, initargs=(str(tokenizer_path),))
+            encoded = pool.imap(_pack_encode, iter_documents(input_path), chunksize=128)
+        else:
+            _pack_init(str(tokenizer_path))
+            encoded = map(_pack_encode, iter_documents(input_path))
+
+        for ids in encoded:
+            (val_writer if n_docs < val_docs else train_writer).write(ids)
+            n_docs += 1
+            if verbose and n_docs % 20000 == 0:
+                print(f"[pack] {n_docs:,} docs | train {train_writer.n_tokens:,} tokens", flush=True)
+            if max_tokens is not None and train_writer.n_tokens >= max_tokens:
+                break
+    finally:
+        if pool is not None:
+            pool.terminate()
+        train_writer.close()
+        val_writer.close()
+
+    meta = {
+        "source": str(input_path),
+        "vocab_size": tokenizer.vocab_size,
+        "n_docs": n_docs,
+        "train_tokens": train_writer.n_tokens,
+        "val_tokens": val_writer.n_tokens,
+    }
+    (out / "meta.json").write_text(json.dumps(meta))
+    if verbose:
+        print(f"[pack] done: {n_docs:,} docs | train {train_writer.n_tokens:,} | "
+              f"val {val_writer.n_tokens:,} -> {out}")
+    return meta
+
