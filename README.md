@@ -91,6 +91,28 @@ python scripts/sft.py --base checkpoints/kuon-13m/kuon-13m-last.pt \
     --data data/sft --out checkpoints/kuon-13m-sft.pt --steps 300
 ```
 
+## Kuon Agent (from scratch)
+
+A `search → think → answer` loop with **no agent framework**, living next to
+the model in `kuon_agent/`:
+
+- `rag.py` — BM25 retrieval implemented from scratch (inverted index, idf,
+  length normalization); index local `.txt`/`.md` corpora
+- `search.py` — Wikipedia API + DuckDuckGo HTML endpoints, stdlib only
+- `agent.py` — gathers evidence, runs an explicit *think* step (bullet
+  notes), then answers **only from evidence**, with `[n]` citations
+- `llm.py` — swappable engines: Kuon checkpoint, Ollama, llama.cpp, mock
+
+```bash
+python -m kuon_agent.cli "who is mr beast"                        # Wikipedia + mock engine
+python -m kuon_agent.cli "who is mr beast" --engine ollama --model qwen2.5-coder:7b
+python -m kuon_agent.cli "what is our launch date" --rag notes/ --no-wiki
+```
+
+The agent never answers without evidence: when search/RAG returns nothing it
+says so. Swapping the engine changes answer quality; the loop and the
+grounding stay identical.
+
 ## Roadmap
 
 - [x] tokenizer, model, trainer, inference, tests — all from scratch
@@ -101,6 +123,8 @@ python scripts/sft.py --base checkpoints/kuon-13m/kuon-13m-last.pt \
 - [ ] pretrain `kuon-48m` / `kuon-107m` (Colab / Kaggle GPU)
 - [ ] preference tuning (DPO)
 - [ ] export to GGUF + llama.cpp for quantized local inference
+- [x] from-scratch agent: Wikipedia/DuckDuckGo search + BM25 RAG + grounded answering
+- [ ] run the agent with a local open model (Ollama) and with Kuon after SFT
 
 
 ## License

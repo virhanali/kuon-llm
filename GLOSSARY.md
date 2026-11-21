@@ -164,6 +164,20 @@ Format teks yang membungkus dialog sebelum masuk model. Kuon memakai
 penanda teks biasa: `User: ...\nAssistant: ...` (belum ada special token
 khusus chat). Saat SFT, loss hanya dihitung pada bagian `Assistant:`.
 
+**Agent**:
+Loop yang mengumpulkan bukti (search/RAG), "berpikir" (catatan), lalu
+menjawab dengan sitasi. Model hanyalah engine yang bisa ditukar
+(Kuon, Ollama/Qwen, llama.cpp).
+
+**RAG (retrieval-augmented generation)**:
+Mencari potongan teks yang relevan dari korpus, menyodorkannya ke model,
+lalu menjawab dari teks itu — bukan dari hafalan bobot.
+
+**BM25**:
+Fungsi ranking pencarian klasik berbasis kata kunci (tf, idf, panjang
+dokumen). Dipakai `kuon_agent/rag.py` sebagai retriever from scratch.
+
+
 
 ### Inference
 

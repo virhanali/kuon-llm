@@ -1,0 +1,21 @@
+[Unit]
+Description=Kuon Studio (agent + OpenAI-compatible API)
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/kuon-llm
+Environment=KUON_ENGINE=ollama
+Environment=OLLAMA_MODEL=qwen2.5:3b
+Environment=OLLAMA_HOST=http://127.0.0.1:11434
+# optional local RAG index:
+# Environment=KUON_RAG=/home/ubuntu/notes
+ExecStart=/home/ubuntu/kuon-llm/venv/bin/python -m kuon_agent.server --engine ollama --bind 127.0.0.1 --port 8000
+Restart=always
+RestartSec=3
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target
