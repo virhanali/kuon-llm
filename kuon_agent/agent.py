@@ -50,6 +50,7 @@ SMALLTALK_PATTERNS = [
     re.compile(r"^(halo|hai|hi|hello|hey|selamat pagi|selamat siang|selamat malam|good morning|good evening|assalamualaikum)\b", re.I),
     re.compile(r"\b(thank you|thanks|terima kasih|makasih)\b", re.I),
     re.compile(r"\b(who are you|what is kuon|who is kuon|tell me about yourself|apa itu kuon|siapa kamu)\b", re.I),
+    re.compile(r"\b(tell me|write|tulis|ceritakan)\b.{0,40}\b(story|cerita)\b", re.I),
 ]
 
 

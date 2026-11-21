@@ -85,3 +85,6 @@ def test_smalltalk_answers_without_search():
     result = agent.answer("halo")
     assert result.sources == []
     assert engine.prompts[-1] == "User: halo\nAssistant:"
+
+    story = agent.answer("Tell me a short story about a cat.")
+    assert story.sources == []
