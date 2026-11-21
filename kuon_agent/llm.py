@@ -75,7 +75,9 @@ class KuonEngine:
         out = [step[0] for step in generate(
             self.model, ids, max_new_tokens=max_tokens, temperature=0.3,
             top_k=40, top_p=0.9, eos_id=self.tokenizer.eos_id)]
-        return self.tokenizer.decode(out)
+        if self.tokenizer.eos_id is not None:
+            out = [token for token in out if token != self.tokenizer.eos_id]
+        return self.tokenizer.decode(out).strip()
 
 
 class OllamaEngine:
