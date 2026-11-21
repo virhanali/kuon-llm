@@ -88,3 +88,6 @@ def test_smalltalk_answers_without_search():
 
     story = agent.answer("Tell me a short story about a cat.")
     assert story.sources == []
+
+    elongated = agent.answer("haloooo")
+    assert elongated.sources == []

@@ -47,7 +47,7 @@ Bullet points:"""
 
 
 SMALLTALK_PATTERNS = [
-    re.compile(r"^(halo|hai|hi|hello|hey|selamat pagi|selamat siang|selamat malam|good morning|good evening|assalamualaikum)\b", re.I),
+    re.compile(r"^(halo+|hallo+|hai+|hi+|hello+|hey+|selamat\s+(pagi|siang|sore|malam)|good\s+(morning|afternoon|evening)|assalamualaikum)\b", re.I),
     re.compile(r"\b(thank you|thanks|terima kasih|makasih)\b", re.I),
     re.compile(r"\b(who are you|what is kuon|who is kuon|tell me about yourself|apa itu kuon|siapa kamu)\b", re.I),
     re.compile(r"\b(tell me|write|tulis|ceritakan)\b.{0,40}\b(story|cerita)\b", re.I),
@@ -125,6 +125,11 @@ class KuonAgent:
 
         sources = self._gather(question)
         if not sources:
+            # short inputs are almost always conversational ("haloooo", "p")
+            if len(question.split()) <= 3:
+                text = self.engine.complete(format_prompt(question),
+                                            max_tokens=self.cfg.max_answer_tokens).strip()
+                return AgentResult(answer=text, notes="", sources=[])
             return AgentResult(
                 answer="I don't know from my sources, and no evidence was found.",
                 notes="no evidence collected",
