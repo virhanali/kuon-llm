@@ -11,16 +11,20 @@ from kuon_agent.server import build_server
 class StubAgent:
     engine = type("E", (), {"name": "stub"})()
 
+    def __init__(self, prefix: str = "answer to"):
+        self.prefix = prefix
+
     def answer(self, question: str) -> AgentResult:
         return AgentResult(
-            answer=f"answer to: {question}",
+            answer=f"{self.prefix}: {question}",
             notes="stub notes",
             sources=[{"title": "Injected source", "url": "https://example.org"}],
         )
 
 
-def with_server(fn):
-    server = build_server(StubAgent(), host="127.0.0.1", port=0)
+def with_server(fn, agents=None):
+    default = StubAgent()
+    server = build_server(default, host="127.0.0.1", port=0, agents=agents)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -61,6 +65,21 @@ def test_chat_completion_and_sources():
         conn.close()
 
     with_server(check)
+
+
+def test_model_routing_between_engines():
+    def check(port: int):
+        conn = HTTPConnection("127.0.0.1", port, timeout=5)
+        body = json.dumps({"model": "qwen",
+                           "messages": [{"role": "user", "content": "hi"}]})
+        conn.request("POST", "/v1/chat/completions", body,
+                     {"Content-Type": "application/json"})
+        data = json.loads(conn.getresponse().read())
+        assert data["model"] == "qwen"
+        assert data["choices"][0]["message"]["content"] == "qwen says: hi"
+        conn.close()
+
+    with_server(check, agents={"kuon-agent": StubAgent(), "qwen": StubAgent("qwen says")})
 
 
 def test_streaming_sse():

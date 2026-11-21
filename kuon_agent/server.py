@@ -155,7 +155,11 @@ def _content_of(message: dict) -> str:
     return str(content)
 
 
-def build_handler(agent, model_name: str = "kuon-agent"):
+def build_handler(agent, model_name: str = "kuon-agent",
+                  agents: dict | None = None):
+    """agents maps model ids -> KuonAgent; model_name is the default id."""
+    registry = dict(agents) if agents else {model_name: agent}
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -197,7 +201,8 @@ def build_handler(agent, model_name: str = "kuon-agent"):
             elif self.path == "/v1/models":
                 self._json(200, {
                     "object": "list",
-                    "data": [{"id": model_name, "object": "model", "owned_by": "kuon"}],
+                    "data": [{"id": name, "object": "model", "owned_by": "kuon"}
+                             for name in registry],
                 })
             elif self.path == "/health":
                 self._json(200, {"status": "ok", "model": model_name})
@@ -218,24 +223,26 @@ def build_handler(agent, model_name: str = "kuon-agent"):
                     self._json(400, {"error": {"message": "no user message"}})
                     return
 
-                result = agent.answer(question)
+                requested = payload.get("model") or model_name
+                chosen = registry.get(requested, agent)
+                result = chosen.answer(question)
                 if payload.get("stream"):
-                    self._stream(result, question)
+                    self._stream(result, question, requested)
                 else:
-                    self._completion(result, question)
+                    self._completion(result, question, requested)
             except Exception as error:  # never leak tracebacks to clients
                 self._json(500, {"error": {"message": str(error)}})
 
         # --------------------------------------------------------- responses
 
-        def _completion(self, result, question: str):
+        def _completion(self, result, question: str, model_id: str = None):
             prompt_tokens = _estimate_tokens(question)
             completion_tokens = _estimate_tokens(result.answer)
             self._json(200, {
                 "id": "chatcmpl-" + uuid.uuid4().hex,
                 "object": "chat.completion",
                 "created": int(time.time()),
-                "model": model_name,
+                "model": model_id or model_name,
                 "choices": [{
                     "index": 0,
                     "message": {"role": "assistant", "content": result.answer},
@@ -250,7 +257,7 @@ def build_handler(agent, model_name: str = "kuon-agent"):
                 "x_notes": result.notes,
             })
 
-        def _stream(self, result, question: str):
+        def _stream(self, result, question: str, model_id: str = None):
             completion_id = "chatcmpl-" + uuid.uuid4().hex
             created = int(time.time())
             self.send_response(200)
@@ -263,7 +270,7 @@ def build_handler(agent, model_name: str = "kuon-agent"):
             def chunk(delta: dict, finish=None):
                 frame = {
                     "id": completion_id, "object": "chat.completion.chunk",
-                    "created": created, "model": model_name,
+                    "created": created, "model": model_id or model_name,
                     "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
                 }
                 self.wfile.write(b"data: " + json.dumps(frame).encode() + b"\n\n")
@@ -279,8 +286,9 @@ def build_handler(agent, model_name: str = "kuon-agent"):
 
 
 def build_server(agent, host: str = "127.0.0.1", port: int = 8000,
-                 model_name: str = "kuon-agent") -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host, port), build_handler(agent, model_name))
+                 model_name: str = "kuon-agent",
+                 agents: dict | None = None) -> ThreadingHTTPServer:
+    return ThreadingHTTPServer((host, port), build_handler(agent, model_name, agents))
 
 
 def agent_from_env(args) -> KuonAgent:
@@ -341,13 +349,21 @@ def main() -> None:
     ap.add_argument("--no-wiki", action="store_true")
     ap.add_argument("--web", action="store_true", help="enable DuckDuckGo search")
     ap.add_argument("--no-think", action="store_true")
+    ap.add_argument("--ollama-model", default=None,
+                    help="register a second engine served as model id 'qwen' (e.g. qwen2.5:3b)")
     ap.add_argument("--bind", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args()
 
     agent = agent_from_env(args)
-    server = build_server(agent, args.bind, args.port)
+    agents = {"kuon-agent": agent}
+    extra_model = args.ollama_model or os.environ.get("KUON_OLLAMA_MODEL")
+    if extra_model:
+        agents["qwen"] = KuonAgent(OllamaEngine(model=extra_model),
+                                   agent.cfg, rag_index=agent.rag)
+    server = build_server(agent, args.bind, args.port, agents=agents)
     print(f"[kuon] serving on http://{args.bind}:{args.port}  (engine: {agent.engine.name})")
+    print(f"[kuon] models: {', '.join(agents)}")
     print("[kuon] OpenAI-compatible base URL: http://host:port/v1")
     try:
         server.serve_forever()
