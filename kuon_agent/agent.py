@@ -8,9 +8,11 @@ Design goals, in order:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Callable
 
+from kuon.chat import format_prompt
 from kuon_agent.rag import BM25Index
 from kuon_agent.search import Source, duckduckgo_search, wikipedia_search
 
@@ -28,15 +30,10 @@ class AgentConfig:
     max_answer_tokens: int = 300
 
 
-ANSWER_PROMPT = """You are a careful assistant. Answer the question using ONLY the evidence below.
-If the evidence does not contain the answer, reply exactly: "I don't know from my sources."
-Cite evidence numbers like [1] where you use them. Be concise.
-
-Question: {question}
-{notes}Evidence:
+ANSWER_PROMPT = """User: {question}
+Evidence:
 {evidence}
-
-Answer:"""
+Assistant:"""
 
 NOTES_PROMPT = """Read the evidence and write 1-3 short bullet points that help answer the question.
 Only state what the evidence says. If nothing is relevant, write: no relevant evidence.
@@ -47,6 +44,19 @@ Evidence:
 Question: {question}
 
 Bullet points:"""
+
+
+SMALLTALK_PATTERNS = [
+    re.compile(r"^(halo|hai|hi|hello|hey|selamat pagi|selamat siang|selamat malam|good morning|good evening|assalamualaikum)\b", re.I),
+    re.compile(r"\b(thank you|thanks|terima kasih|makasih)\b", re.I),
+    re.compile(r"\b(who are you|what is kuon|who is kuon|tell me about yourself|apa itu kuon|siapa kamu)\b", re.I),
+]
+
+
+def is_smalltalk(question: str) -> bool:
+    """Greetings, thanks, and identity questions are answered directly
+    (no search) using the chat template the model was fine-tuned on."""
+    return any(pattern.search(question.strip()) for pattern in SMALLTALK_PATTERNS)
 
 
 @dataclass
@@ -106,6 +116,12 @@ class KuonAgent:
     # ---------------------------------------------------------------- loop
 
     def answer(self, question: str) -> AgentResult:
+        if is_smalltalk(question):
+            # answer in the model's own chat format, without search
+            text = self.engine.complete(format_prompt(question),
+                                        max_tokens=self.cfg.max_answer_tokens).strip()
+            return AgentResult(answer=text, notes="", sources=[])
+
         sources = self._gather(question)
         if not sources:
             return AgentResult(
@@ -122,9 +138,8 @@ class KuonAgent:
                 max_tokens=120,
             ).strip()
 
-        notes_block = f"Notes:\n{notes}\n\n" if notes else ""
         answer = self.engine.complete(
-            ANSWER_PROMPT.format(question=question, notes=notes_block, evidence=evidence),
+            ANSWER_PROMPT.format(question=question, evidence=evidence),
             max_tokens=self.cfg.max_answer_tokens,
         ).strip()
 

@@ -76,3 +76,12 @@ def test_agent_uses_injected_search_functions():
     result = agent.answer("anything")
     assert result.sources[0]["title"] == "Injected"
     assert "Injected evidence." in engine.prompts[-1]
+
+
+def test_smalltalk_answers_without_search():
+    engine = RecordingEngine()
+    agent = KuonAgent(engine, AgentConfig(use_wiki=True, use_web=False), rag_index=make_index(),
+                      wiki_fn=lambda q, n: [Source(title="Wiki", url="", text="Halo the game.")])
+    result = agent.answer("halo")
+    assert result.sources == []
+    assert engine.prompts[-1] == "User: halo\nAssistant: "

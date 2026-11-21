@@ -333,7 +333,7 @@ def agent_from_env(args) -> KuonAgent:
         use_wiki=not args.no_wiki,
         use_web=args.web,
         fallback_web=args.web,
-        think=not args.no_think,
+        think=False,
     ), rag_index=rag_index)
 
 
