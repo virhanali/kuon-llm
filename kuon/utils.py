@@ -7,8 +7,8 @@ import random
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
+import numpy as np
 
 
 def seed_all(seed: int) -> None:

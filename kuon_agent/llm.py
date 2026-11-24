@@ -38,7 +38,9 @@ class MockEngine:
 class KuonEngine:
     name = "kuon"
 
-    def __init__(self, checkpoint: str, device: str | None = None):
+    def __init__(self, checkpoint: str, device: str | None = None,
+                 *, tokenizer_path: str | Path | None = None, temperature: float = 0.3,
+                 repetition_penalty: float = 1.0, no_repeat_ngram_size: int = 4):
         import torch
 
         from kuon.config import ModelConfig
@@ -47,11 +49,14 @@ class KuonEngine:
 
         self.torch = torch
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.temperature = temperature
+        self.repetition_penalty = repetition_penalty
+        self.no_repeat_ngram_size = no_repeat_ngram_size
         state = torch.load(checkpoint, map_location="cpu", weights_only=False)
         self.model_cfg = ModelConfig(**state["model_cfg"])
         # the tokenizer lives next to the checkpoint when shipped (release
         # asset), or in the original data dir on the training machine
-        candidates = [
+        candidates = [Path(tokenizer_path)] if tokenizer_path else [
             Path(checkpoint).parent / "tokenizer.json",
             Path(state["train_cfg"].get("data_dir", "")) / "tokenizer.json",
         ]
@@ -64,8 +69,13 @@ class KuonEngine:
                 "tokenizer.json not found next to the checkpoint. "
                 f"Looked in: {[str(c) for c in candidates]}. "
                 "Download it from the GitHub release into the checkpoint folder.")
+        if self.tokenizer.vocab_size != self.model_cfg.vocab_size:
+            raise ValueError("tokenizer vocabulary size does not match checkpoint")
         self.model = Transformer(self.model_cfg).to(self.device).eval()
         self.model.load_state_dict(state["model"])
+
+    def prompt_fits(self, prompt: str, max_tokens: int) -> bool:
+        return len(self.tokenizer.encode(prompt)) + max_tokens <= self.model_cfg.block_size
 
     def complete(self, prompt: str, max_tokens: int = 256) -> str:
         from kuon.generate import generate
@@ -73,8 +83,10 @@ class KuonEngine:
         ids = self.torch.tensor([self.tokenizer.encode(prompt)], dtype=self.torch.long,
                                 device=self.device)
         out = [step[0] for step in generate(
-            self.model, ids, max_new_tokens=max_tokens, temperature=0.3,
-            top_k=40, top_p=0.9, eos_id=self.tokenizer.eos_id)]
+            self.model, ids, max_new_tokens=max_tokens, temperature=self.temperature,
+            top_k=40, top_p=0.9, eos_id=self.tokenizer.eos_id,
+            repetition_penalty=self.repetition_penalty,
+            no_repeat_ngram_size=self.no_repeat_ngram_size)]
         if self.tokenizer.eos_id is not None:
             out = [token for token in out if token != self.tokenizer.eos_id]
         return self.tokenizer.decode(out).strip()

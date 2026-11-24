@@ -1,7 +1,7 @@
 [project]
 name = "kuon-llm"
 version = "0.1.0"
-description = "Kuon: a small English-first open-weight LLM, built from scratch (tokenizer, transformer, trainer, inference)."
+description = "Kuon: a from-scratch English-Indonesian LLM and evidence-grounded business agent in PyTorch."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"

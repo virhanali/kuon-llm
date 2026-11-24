@@ -8,6 +8,8 @@ Design goals, in order:
 
 from __future__ import annotations
 
+import ast
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Callable
@@ -15,6 +17,224 @@ from typing import Callable
 from kuon.chat import format_prompt
 from kuon_agent.rag import BM25Index
 from kuon_agent.search import Source, duckduckgo_search, wikipedia_search
+from kuon_agent.tools import (
+    FactLedger,
+    business_kpi,
+    extract_grounded_numbers,
+    parse_amount,
+    parse_table,
+    period_aliases,
+    safe_calc,
+    summarize_table,
+    verify_grounded_answer,
+)
+
+
+_TOOL_CALL_RE = re.compile(
+    r"^\s*TOOL:\s*(calc|kpi)\(([^)\n]{1,220})\)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_ID_WORDS = re.compile(
+    r"\b(?:apa|apakah|berapa|berikut|biaya|bulan|dari|harga|hitung|hpp|kami|ke|kotor|minggu|omzet|pendapatan|persen|pesanan|turun|yang)\b",
+    re.I,
+)
+_CHANGE_TERMS = re.compile(
+    r"\b(?:perubahan|selisih|turun|naik|penurunan|kenaikan|change[ds]?|increase[ds]?|decrease[ds]?|fell|drop(?:ped)?|rise|rose|growth)\b",
+    re.I,
+)
+_SALES_CHANGE_REQUEST = re.compile(
+    r"(?:"
+    r"(?:berapa|hitung(?:kan)?|cari|tentukan)?\s*(?:persen(?:tase)?\s+)?(?:perubahan|kenaikan|penurunan)\s+(?:omzet|pendapatan|penjualan)"
+    r"|(?:omzet|pendapatan|penjualan)\s+.*?(?:perubahan|turun|naik).*?(?:persen|%)"
+    r"|(?:berapa\s+persen(?:tase)?)\s+(?:perubahan\s+|kenaikan\s+|penurunan\s+)?(?:omzet|pendapatan|penjualan)"
+    r"|(?:what\s+(?:is|was)|calculate|compute|find)?\s*(?:the\s+)?(?:revenue|sales(?:\s+revenue)?)\s+(?:percent(?:age)?\s+)?change"
+    r"|(?:percent(?:age)?\s+change\s+(?:in|of)\s+(?:revenue|sales))"
+    r"|by\s+what\s+percent(?:age)?\s+did\s+(?:revenue|sales)"
+    r"|how\s+much\s+(?:percent(?:age)?\s+)?did\s+(?:revenue|sales)\s+(?:change|drop|fall|rise|grow|increase|decrease)"
+    r")",
+    re.I,
+)
+_REVENUE_HEADERS = frozenset({"omzet", "pendapatan", "revenue", "sales", "sales revenue", "penjualan"})
+_FROM_TO_RE = re.compile(
+    r"(?<!\w)(?:dari|from)\s+([A-Za-z0-9][A-Za-z0-9 _\-]{0,24}?)\s+(?:ke|to|hingga|sampai)\s+([A-Za-z0-9][A-Za-z0-9 _\-]{0,24}?)(?=\s*(?:[?.!,;]|dan\b|and\b|dibanding|versus|vs\b|$))",
+    re.I,
+)
+_ARROW_PERIOD_RE = re.compile(
+    r"(?<!\w)([A-Za-z0-9][A-Za-z0-9 _\-]{0,18}?)\s*(?:->|→)\s*([A-Za-z0-9][A-Za-z0-9 _\-]{0,18}?)(?=\s*(?:[?.!,;]|dan\b|and\b|$))",
+    re.I,
+)
+_AMOUNT_TOKEN_RE = re.compile(
+    r"\(?[+\-−]?(?:(?:Rp\.?|IDR|USD|EUR|GBP|JPY|[$€£¥])\s*)?"
+    r"\d+(?:[.,]\d+)*"
+    r"(?:\s*(?:miliar|milyar|billion|bn|juta|jt|million|mn|ribu|rb|k|IDR|USD|EUR|GBP|JPY)\b)?\)?",
+    re.I,
+)
+_CALC_CONSTANTS = frozenset({0.0, 1.0, 2.0, 100.0})
+
+_KPI_REQUEST_PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
+    ("gross_margin", re.compile(r"\b(?:gross\s+(?:profit\s+)?margin|margin\s+(?:kotor|bruto))\b", re.I)),
+    ("net_margin", re.compile(r"\b(?:net\s+(?:profit\s+)?margin|margin\s+(?:bersih|neto))\b", re.I)),
+    ("conversion_rate", re.compile(r"\b(?:conversion\s+rate|tingkat\s+konversi|rasio\s+konversi)\b", re.I)),
+    ("breakeven_units", re.compile(r"\b(?:break[\s\-]?even(?:\s+units?)?|titik\s+impas|balik\s+modal)\b", re.I)),
+    ("aov", re.compile(r"\b(?:aov|average\s+order\s+value|rata-rata\s+(?:nilai\s+)?(?:per\s+)?pesanan)\b", re.I)),
+    ("roi", re.compile(r"\b(?:roi|return\s+on\s+investment)\b", re.I)),
+)
+
+_AMOUNT_CAPTURE = (
+    r"((?:(?:Rp\.?|IDR|USD|EUR|GBP|JPY|[$€£¥])\s*)?"
+    r"\d+(?:[.,]\d+)*"
+    r"(?:\s*(?:miliar|milyar|billion|bn|juta|jt|million|mn|ribu|rb|k|IDR|USD|EUR|GBP|JPY)\b)?)"
+)
+_FIELD_PATTERNS: dict[str, tuple[re.Pattern, ...]] = {
+    "revenue": (
+        re.compile(rf"\b(?:omzet|pendapatan|gross\s+revenue|total\s+revenue|revenue|penjualan)\b(?:\s+(?:bulan|minggu|pekan|tahun|kuartal)\s+(?:ini|lalu))?\s*(?:is|was|adalah|sebesar|=|:|of)?\s*{_AMOUNT_CAPTURE}", re.I),
+    ),
+    "cogs": (
+        re.compile(rf"\b(?:hpp|cogs|cost\s+of\s+goods\s+sold|harga\s+pokok(?:\s+penjualan)?|biaya\s+pokok(?:\s+penjualan)?)\b(?:\s+(?:bulan|minggu|pekan)\s+(?:ini|lalu))?\s*(?:is|was|adalah|sebesar|=|:|of)?\s*{_AMOUNT_CAPTURE}", re.I),
+    ),
+    "total_cost": (
+        re.compile(rf"\b(?:total\s+(?:cost|biaya)|biaya\s+total)\b\s*(?:is|was|adalah|sebesar|=|:|of)?\s*{_AMOUNT_CAPTURE}", re.I),
+    ),
+    "visitors": (
+        re.compile(rf"\b(?:pengunjung(?:\s+situs|\s+toko|\s+aplikasi)?|visitors?|kunjungan|sessions?)\b(?:\s+(?:minggu|pekan|bulan)\s+(?:ini|lalu))?\s*(?:is|was|adalah|sebesar|=|:|of|sebanyak)?\s*{_AMOUNT_CAPTURE}", re.I),
+        re.compile(rf"{_AMOUNT_CAPTURE}\s*(?:orang\s+)?(?:pengunjung|store\s+visitors?|website\s+visitors?|visitors?|sessions?)\b", re.I),
+    ),
+    "buyers": (
+        re.compile(rf"\b(?:yang\s+membeli|pembeli|buyers?|completed\s+buyers?)\b\s*(?:is|was|adalah|sebesar|=|:|of|sebanyak)?\s*{_AMOUNT_CAPTURE}", re.I),
+        re.compile(rf"{_AMOUNT_CAPTURE}\s*(?:orang\s+)?(?:pembeli|buyers?)\b", re.I),
+    ),
+    "orders": (
+        re.compile(rf"\b(?:jumlah\s+pesanan|total\s+pesanan|pesanan|orders?|transaksi)\b\s*(?:is|was|adalah|sebesar|=|:|of|sebanyak)?\s*{_AMOUNT_CAPTURE}", re.I),
+        re.compile(rf"{_AMOUNT_CAPTURE}\s*(?:pesanan|completed\s+orders?|customer\s+orders?|orders?|transaksi)\b", re.I),
+    ),
+    "fixed_cost": (
+        re.compile(rf"\b(?:biaya\s+tetap(?:\s+usaha)?|fixed\s+costs?)\b(?:\s+(?:per\s+bulan|bulanan|kami))?\s*(?:is|was|are|adalah|sebesar|=|:|of)?\s*{_AMOUNT_CAPTURE}", re.I),
+    ),
+    "unit_price": (
+        re.compile(rf"\b(?:harga\s+jual(?:\s+per\s+unit)?|unit\s+(?:selling\s+)?price|selling\s+price(?:\s+per\s+unit)?)\b\s*(?:is|was|adalah|sebesar|=|:|of)?\s*{_AMOUNT_CAPTURE}", re.I),
+    ),
+    "unit_cost": (
+        re.compile(rf"\b(?:biaya\s+variabel(?:\s+per\s+unit)?|unit\s+variable\s+cost|variable\s+cost(?:\s+per\s+unit)?|unit\s+cost|biaya\s+produksi(?:\s+per\s+unit)?)\b\s*(?:is|was|adalah|sebesar|=|:|of)?\s*{_AMOUNT_CAPTURE}", re.I),
+    ),
+    "gain": (
+        re.compile(rf"\b(?:gross\s+contribution|gain|keuntungan\s+kotor|hasil\s+penjualan|pendapatan\s+kampanye|omzet\s+kampanye)\b\s*(?:is|was|adalah|sebesar|=|:|of)?\s*{_AMOUNT_CAPTURE}", re.I),
+        re.compile(rf"generated\s+{_AMOUNT_CAPTURE}\s+in\s+(?:gross\s+contribution|revenue|gain)", re.I),
+    ),
+    "cost": (
+        re.compile(rf"\b(?:biaya\s+iklan|biaya\s+kampanye|ad\s+spend|campaign\s+spend|spend|modal|cost)\b\s*(?:is|was|adalah|sebesar|=|:|of)?\s*{_AMOUNT_CAPTURE}", re.I),
+        re.compile(rf"(?:on|spent)\s+{_AMOUNT_CAPTURE}\s+(?:spend|on\s+ads|cost)\b", re.I),
+    ),
+}
+_KPI_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
+    "gross_margin": ("revenue", "cogs"),
+    "net_margin": ("revenue", "total_cost"),
+    "conversion_rate": ("buyers", "visitors"),
+    "breakeven_units": ("fixed_cost", "unit_price", "unit_cost"),
+    "aov": ("revenue", "orders"),
+    "roi": ("gain", "cost"),
+}
+_MONETARY_FIELDS = frozenset({"revenue", "cogs", "total_cost", "fixed_cost", "unit_price", "unit_cost", "gain", "cost"})
+
+
+def _extract_embedded_table(text: str) -> str | None:
+    """Detect a Markdown table or multi-row numeric CSV block inside a client message."""
+    lines = text.splitlines()
+    md_block = [ln.strip() for ln in lines if ln.strip().startswith("|") and ln.strip().endswith("|")]
+    if len(md_block) >= 3:
+        return "\n".join(md_block)
+    csv_block: list[str] = []
+    for ln in lines:
+        s = ln.strip()
+        if "," in s and len(s.split(",")) >= 2 and not s.endswith("?"):
+            csv_block.append(s)
+        elif len(csv_block) >= 3:
+            break
+        else:
+            csv_block = []
+    if len(csv_block) >= 3:
+        return "\n".join(csv_block)
+    return None
+
+
+def _extract_labeled_fields(texts: list[str]) -> dict[str, tuple[float, str | None]]:
+    """Extract explicitly labeled numeric business fields across user turns (latest turn wins)."""
+    bound: dict[str, tuple[float, str | None]] = {}
+    for text in texts:
+        non_table = "\n".join(ln for ln in text.splitlines() if not ln.strip().startswith("|"))
+        for field_name, patterns in _FIELD_PATTERNS.items():
+            for pat in patterns:
+                for m in pat.finditer(non_table):
+                    val, unit = parse_amount(m.group(1))
+                    if val is not None:
+                        bound[field_name] = (val, unit)
+    return bound
+
+
+def _number_in_set(val: float, allowed: set[float]) -> bool:
+    return any(abs(val - a) <= max(1e-6, 1e-5 * abs(a)) for a in allowed)
+
+
+def _calc_literals(expr: str) -> list[float]:
+    tree = ast.parse(expr.strip().replace(",", ""), mode="eval")
+    vals: list[float] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            vals.append(float(node.value))
+    return vals
+
+
+def _execute_tool_call(
+    kind: str,
+    arg_str: str,
+    *,
+    allowed_numbers: set[float] | None = None,
+    bound_fields: dict[str, tuple[float, str | None]] | None = None,
+) -> tuple[str | None, str | None]:
+    """Deterministically execute a `calc(...)` or `kpi(...)` call emitted by Kuon.
+
+    Returns `(tool_output, error_reason)`. When `allowed_numbers` is provided, every
+    numeric argument must be grounded in the user's conversation or verified evidence.
+    """
+    kind_l = kind.strip().lower()
+    try:
+        if kind_l == "calc":
+            raw_expr = arg_str.strip().strip("'\"")
+            if allowed_numbers is not None:
+                for lit in _calc_literals(raw_expr):
+                    if lit not in _CALC_CONSTANTS and not _number_in_set(lit, allowed_numbers):
+                        return None, f"tool_error(ungrounded_args): calc literal {lit} not found in user data"
+            val = safe_calc(raw_expr)
+            return f"calc({arg_str.strip()}) = {val:.4f}".rstrip("0").rstrip("."), None
+        if kind_l == "kpi":
+            parts = [p.strip() for p in arg_str.split(",") if p.strip()]
+            if not parts:
+                return None, "tool_error(invalid_args)"
+            metric = parts[0].strip("'\"")
+            kwargs: dict[str, float] = {}
+            for p in parts[1:]:
+                if "=" not in p:
+                    return None, "tool_error(invalid_args)"
+                key, raw = (s.strip() for s in p.split("=", 1))
+                value = float(raw)
+                if key in kwargs or not math.isfinite(value):
+                    return None, "tool_error(invalid_args)"
+                kwargs[key] = value
+            if allowed_numbers is not None:
+                for key, val in kwargs.items():
+                    if not _number_in_set(val, allowed_numbers):
+                        return None, f"tool_error(ungrounded_args): {key}={val} not found in user data"
+                    if bound_fields and key in bound_fields:
+                        expected_val = bound_fields[key][0]
+                        if abs(val - expected_val) > max(1e-6, 1e-5 * abs(expected_val)):
+                            return None, f"tool_error(ungrounded_args): {key}={val} contradicts stated {expected_val}"
+            res = business_kpi(metric, **kwargs)
+            if any(isinstance(v, float) and not math.isfinite(v) for v in res.values()):
+                return None, "tool_error(non_finite)"
+            summary_bits = ", ".join(f"{k}={v}" for k, v in res.items() if k != "metric")
+            return f"kpi({metric}): {summary_bits}", None
+    except (ValueError, ArithmeticError, SyntaxError, TypeError) as err:
+        return None, f"tool_error({type(err).__name__})"
+    return None, "tool_error(unknown)"
 
 
 @dataclass
@@ -29,11 +249,6 @@ class AgentConfig:
     max_source_chars: int = 1200
     max_answer_tokens: int = 300
 
-
-ANSWER_PROMPT = """User: {question}
-Evidence:
-{evidence}
-Assistant:"""
 
 NOTES_PROMPT = """Read the evidence and write 1-3 short bullet points that help answer the question.
 Only state what the evidence says. If nothing is relevant, write: no relevant evidence.
@@ -65,6 +280,366 @@ class AgentResult:
     answer: str
     notes: str = ""
     sources: list[dict] = field(default_factory=list)
+
+
+def _match_period_row(mention: str, rows: list[list[str]], period_header: str) -> int | None:
+    """Resolve a period mention (e.g. 'Week 2', 'W2', 'Minggu 1') to a unique row index."""
+    clean = " ".join(mention.strip().casefold().split())
+    if not clean:
+        return None
+    exact = [i for i, r in enumerate(rows) if r and " ".join(r[0].strip().casefold().split()) == clean]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        return None
+    mention_keys = period_aliases(mention, period_header)
+    if not mention_keys:
+        return None
+    hits = [
+        i for i, r in enumerate(rows)
+        if r and (mention_keys & period_aliases(r[0], period_header))
+    ]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _apply_table_followups(
+    headers: list[str],
+    rows: list[list[str]],
+    rev_col: int,
+    followups: list[str],
+) -> tuple[list[list[str]], list[str]]:
+    """Patch missing or corrected revenue cells from follow-up user messages."""
+    patched = [list(r) for r in rows]
+    notes: list[str] = []
+    period_header = headers[0] if headers else ""
+
+    for msg in followups:
+        # 1. Explicit period-to-value mentions (e.g. "W2 revenue was 8000", "Omzet M2 = Rp8.250.000")
+        matched_any = False
+        for i, row in enumerate(patched):
+            if not row:
+                continue
+            label = row[0].strip()
+            aliases = period_aliases(label, period_header)
+            # Build readable candidate prefixes for this row (e.g., W2, Week 2, Minggu 2, M2)
+            cand_patterns: list[str] = [re.escape(label)]
+            for key in aliases:
+                if key.startswith("week:"):
+                    n = key.split(":", 1)[1]
+                    cand_patterns.extend([rf"w[\s\-]*{n}", rf"week[\s\-]*{n}", rf"minggu[\s\-]*{n}", rf"m[\s\-]*{n}"])
+                elif key.startswith("month:"):
+                    n = key.split(":", 1)[1]
+                    cand_patterns.extend([rf"month[\s\-]*{n}", rf"bulan[\s\-]*{n}", rf"m[\s\-]*{n}"])
+                elif key.startswith("quarter:"):
+                    n = key.split(":", 1)[1]
+                    cand_patterns.extend([rf"q[\s\-]*{n}", rf"quarter[\s\-]*{n}", rf"kuartal[\s\-]*{n}"])
+                elif key.startswith("period:"):
+                    n = key.split(":", 1)[1]
+                    cand_patterns.extend([rf"p[\s\-]*{n}", rf"period(?:e)?[\s\-]*{n}"])
+            alias_re = "(?:" + "|".join(dict.fromkeys(cand_patterns)) + ")"
+            pat_forward = re.compile(
+                rf"(?<!\w){alias_re}(?!\w)\s*(?:revenue|omzet|pendapatan|sales|penjualan)?\s*(?:was|is|adalah|sebesar|menjadi|to|ke|=|:)?\s*{_AMOUNT_CAPTURE}",
+                re.I,
+            )
+            pat_reverse = re.compile(
+                rf"(?:revenue|omzet|pendapatan|sales|penjualan)\s+(?:for|untuk|di|pada)?\s*(?<!\w){alias_re}(?!\w)\s*(?:was|is|adalah|sebesar|menjadi|to|ke|=|:)?\s*{_AMOUNT_CAPTURE}",
+                re.I,
+            )
+            val_str = None
+            for p in (pat_reverse, pat_forward):
+                m = p.search(msg)
+                if m:
+                    val_str = m.group(1).strip()
+                    break
+            if val_str:
+                val, _ = parse_amount(val_str)
+                if val is not None:
+                    while len(row) <= rev_col:
+                        row.append("")
+                    row[rev_col] = val_str
+                    notes.append(f"follow-up {label}={val_str}")
+                    matched_any = True
+
+        # 2. Fallback: if user gave a single amount and exactly one row has an empty revenue cell
+        if not matched_any:
+            empty_idxs = [i for i, r in enumerate(patched) if rev_col >= len(r) or not r[rev_col].strip()]
+            amounts = [m.group(0).strip() for m in _AMOUNT_TOKEN_RE.finditer(msg) if parse_amount(m.group(0))[0] is not None]
+            if len(empty_idxs) == 1 and len(amounts) == 1:
+                idx = empty_idxs[0]
+                while len(patched[idx]) <= rev_col:
+                    patched[idx].append("")
+                patched[idx][rev_col] = amounts[0]
+                label = patched[idx][0].strip() if patched[idx] else f"row {idx + 1}"
+                notes.append(f"follow-up {label}={amounts[0]}")
+
+    return patched, notes
+
+
+def _find_sales_request(text: str) -> str:
+    return next(
+        (
+            sentence.strip()
+            for line in text.splitlines()
+            if not line.strip().startswith("|")
+            for sentence in re.split(r"(?<=[.!?])\s+", line)
+            if _SALES_CHANGE_REQUEST.search(sentence) and _CHANGE_TERMS.search(sentence)
+        ),
+        "",
+    )
+
+
+def _answer_sales_change(
+    user_msgs: list[str],
+    indonesian: bool,
+) -> AgentResult | None:
+    """Compute a grounded two-period revenue comparison across single-turn or multi-turn chat."""
+    table_idx: int | None = None
+    table_text: str | None = None
+    for idx in range(len(user_msgs) - 1, -1, -1):
+        tbl = _extract_embedded_table(user_msgs[idx])
+        if tbl is not None:
+            table_idx = idx
+            table_text = tbl
+            break
+
+    # Locate the active sales-change request (latest turn first, else the turn with the table)
+    request = ""
+    req_idx: int | None = None
+    for idx in range(len(user_msgs) - 1, -1, -1):
+        cand = _find_sales_request(user_msgs[idx])
+        if cand:
+            request = cand
+            req_idx = idx
+            break
+    if not request:
+        return None
+    # If the user moved on to a completely unrelated topic after an earlier sales table, don't hijack it
+    if table_idx is not None and req_idx is not None and table_idx < len(user_msgs) - 1:
+        latest = user_msgs[-1]
+        if _extract_embedded_table(latest) is None and not _AMOUNT_TOKEN_RE.search(latest) and not _SALES_CHANGE_REQUEST.search(latest):
+            return None
+
+    def reply(id_text: str, en_text: str) -> AgentResult:
+        return AgentResult(id_text if indonesian else en_text)
+
+    try:
+        headers, rows = parse_table(table_text or "")
+    except ValueError:
+        headers, rows = [], []
+    columns = [i for i, h in enumerate(headers) if h.casefold() in _REVENUE_HEADERS]
+    if len(columns) != 1 or len(rows) < 2:
+        return reply(
+            "Bisa kirim tabel minimal dua periode dengan satu kolom omzet untuk menghitung persentase perubahannya?",
+            "Can you share a table with at least two periods and one revenue column so I can calculate the change?",
+        )
+
+    col = columns[0]
+    followups = user_msgs[table_idx + 1:] if table_idx is not None else []
+    rows, patch_notes = _apply_table_followups(headers, rows, col, followups)
+    period_header = headers[0] if headers else ""
+
+    # Resolve explicit period pair ("from A to B" / "dari A ke B" / "A -> B")
+    explicit = _FROM_TO_RE.search(request) or _ARROW_PERIOD_RE.search(request)
+    if explicit:
+        start_mention, end_mention = explicit.group(1).strip(), explicit.group(2).strip()
+        old_idx = _match_period_row(start_mention, rows, period_header)
+        new_idx = _match_period_row(end_mention, rows, period_header)
+        if old_idx is None or new_idx is None or old_idx == new_idx:
+            avail = ", ".join(r[0].strip() for r in rows if r and r[0].strip())
+            return reply(
+                f"Saya belum bisa mencocokkan periode '{start_mention}' ke '{end_mention}' pada tabel ({avail}). Periode mana yang ingin dibandingkan?",
+                f"I couldn't uniquely match '{start_mention}' to '{end_mention}' in the table ({avail}). Which two periods should I compare?",
+            )
+    else:
+        if len(rows) != 2:
+            avail = ", ".join(r[0].strip() for r in rows if r and r[0].strip())
+            return reply(
+                f"Tabel memuat {len(rows)} periode ({avail}). Dua periode mana yang ingin dibandingkan?",
+                f"The table has {len(rows)} periods ({avail}). Which two periods should I compare?",
+            )
+        old_idx, new_idx = 0, 1
+
+    old_row, new_row = rows[old_idx], rows[new_idx]
+    old_label = old_row[0].strip() if old_row else "period 1"
+    new_label = new_row[0].strip() if new_row else "period 2"
+    old_raw = old_row[col].strip() if col < len(old_row) else ""
+    new_raw = new_row[col].strip() if col < len(new_row) else ""
+
+    missing_labels = [lbl for lbl, raw in ((old_label, old_raw), (new_label, new_raw)) if not raw]
+    if missing_labels:
+        missing_str = ", ".join(missing_labels)
+        return reply(
+            f"Bisa isi omzet {missing_str} yang masih kosong? Saya perlu satu angka omzet untuk masing-masing periode.",
+            f"Can you fill in the missing revenue for {missing_str}? I need one revenue figure for each period.",
+        )
+
+    old_val, old_unit = parse_amount(old_raw)
+    new_val, new_unit = parse_amount(new_raw)
+    if old_val is None or new_val is None:
+        return reply(
+            "Ada angka omzet yang formatnya belum terbaca jelas. Bisa tulis angka omzet yang benar untuk kedua periode?",
+            "One of the revenue values could not be parsed cleanly. Can you confirm the exact revenue figures for both periods?",
+        )
+    if old_unit and new_unit and old_unit != new_unit:
+        return reply(
+            f"Mata uang kedua periode berbeda ({old_label}: {old_unit}, {new_label}: {new_unit}). Bisa samakan satuannya dulu sebelum dihitung?",
+            f"The two periods use different currencies ({old_label}: {old_unit}, {new_label}: {new_unit}). Can you convert them to one currency first?",
+        )
+    if old_val == 0:
+        return reply(
+            f"Omzet awal ({old_label}) nol, jadi persentase perubahan tidak bisa dihitung. Bandingkan selisih omzet kedua periode dalam satuan uang.",
+            f"Starting revenue ({old_label}) is zero, so a percentage change is undefined. Compare the revenue difference in currency instead.",
+        )
+
+    result = business_kpi("pct_change", old=old_val, new=new_val)
+    pct = f"{result['pct_change'] or 0:.2f}".rstrip("0").rstrip(".")
+    if indonesian:
+        answer = (
+            f"Perubahan omzet dari {old_label} ke {new_label}: {pct.replace('.', ',')}%.\n\n"
+            "Bandingkan jumlah pesanan dan rata-rata omzet per pesanan sebelum memilih tindakan yang akan diuji."
+        )
+    else:
+        answer = (
+            f"Revenue change from {old_label} to {new_label}: {pct}%.\n\n"
+            "Compare order counts and average revenue per order before choosing what to test."
+        )
+    provenance = f"{old_label}={old_val}, {new_label}={new_val}"
+    if patch_notes:
+        provenance += " (" + "; ".join(patch_notes) + ")"
+    return AgentResult(
+        answer=answer,
+        notes=f"kpi(pct_change): {provenance}; {result['formula']} = {pct}%",
+        sources=[{"title": "tool:kpi", "url": ""}],
+    )
+
+
+def _format_num(val: float, indonesian: bool) -> str:
+    txt = f"{val:.2f}".rstrip("0").rstrip(".")
+    return txt.replace(".", ",") if indonesian else txt
+
+
+def _answer_direct_kpi(user_msgs: list[str], indonesian: bool) -> AgentResult | None:
+    """Compute grounded standard KPIs (margin, conversion, break-even, AOV, ROI) with provenance."""
+    # Find the latest explicit KPI request across user turns
+    metric: str | None = None
+    req_idx: int | None = None
+    for idx in range(len(user_msgs) - 1, -1, -1):
+        non_table = "\n".join(ln for ln in user_msgs[idx].splitlines() if not ln.strip().startswith("|"))
+        for name, pat in _KPI_REQUEST_PATTERNS:
+            if pat.search(non_table):
+                metric = name
+                req_idx = idx
+                break
+        if metric is not None:
+            break
+    if metric is None or req_idx is None:
+        return None
+    # Do not hijack non-KPI follow-ups or general questions without any numbers/missing-input context
+    if req_idx < len(user_msgs) - 1 and not _AMOUNT_TOKEN_RE.search(user_msgs[-1]):
+        return None
+    # Only handle explicit calculation asks (question mark or calculate/hitung/berapa/what/how many)
+    req_text = user_msgs[req_idx]
+    if not re.search(r"\?|berapa|hitung|what|how\s+many|calculate|compute", req_text, re.I):
+        return None
+
+    bound = _extract_labeled_fields(user_msgs)
+    required = _KPI_REQUIRED_FIELDS[metric]
+    missing = [f for f in required if f not in bound]
+    if missing:
+        # Only ask if the user provided at least one relevant input or explicitly asked to compute
+        if not any(f in bound for f in required):
+            return None
+        missing_labels_id = {
+            "revenue": "omzet", "cogs": "HPP", "total_cost": "total biaya",
+            "buyers": "jumlah pembeli", "visitors": "jumlah pengunjung",
+            "fixed_cost": "biaya tetap", "unit_price": "harga jual per unit",
+            "unit_cost": "biaya variabel per unit", "gain": "pendapatan/keuntungan kotor",
+            "cost": "biaya/modal", "orders": "jumlah pesanan",
+        }
+        missing_labels_en = {
+            "revenue": "revenue", "cogs": "COGS", "total_cost": "total cost",
+            "buyers": "buyers", "visitors": "visitors",
+            "fixed_cost": "fixed cost", "unit_price": "unit price",
+            "unit_cost": "unit variable cost", "gain": "gross contribution/gain",
+            "cost": "cost/spend", "orders": "order count",
+        }
+        if indonesian:
+            need = ", ".join(missing_labels_id[m] for m in missing)
+            return AgentResult(f"Data {need} belum tersedia untuk menghitung {metric.replace('_', ' ')}. Berapa angka {need} pada periode yang sama?")
+        need = ", ".join(missing_labels_en[m] for m in missing)
+        return AgentResult(f"Missing {need} to calculate {metric.replace('_', ' ')}. What is the {need} for the same period?")
+
+    # Check currency consistency across monetary inputs
+    units = {bound[f][1] for f in required if f in _MONETARY_FIELDS and bound[f][1]}
+    if len(units) > 1:
+        u_list = ", ".join(sorted(units))
+        if indonesian:
+            return AgentResult(f"Satuan mata uang tidak sama ({u_list}). Bisa samakan semua angka ke satu mata uang dulu?")
+        return AgentResult(f"The inputs use mixed currencies ({u_list}). Can you convert them to one currency first?")
+
+    kwargs = {f: bound[f][0] for f in required}
+    try:
+        res = business_kpi(metric, **kwargs)
+    except (ValueError, ZeroDivisionError) as err:
+        if indonesian:
+            return AgentResult(f"Perhitungan belum bisa dijalankan ({err}). Bisa periksa kembali angka masukannya?")
+        return AgentResult(f"The calculation could not run ({err}). Can you double-check the input figures?")
+
+    inputs_trace = ", ".join(f"{k}={kwargs[k]}" for k in required)
+    if metric == "gross_margin":
+        val_txt = _format_num(res["margin_pct"], indonesian)
+        ans = (
+            f"Margin kotor: {val_txt}%.\n\nPeriksa komponen HPP terbesar dan pantau rasio margin kotor setiap minggu."
+            if indonesian else
+            f"Gross margin: {val_txt}%.\n\nReview the largest cost items and track weekly margin ratio before changing prices."
+        )
+        note = f"kpi(gross_margin): {inputs_trace}; gross_profit={res['gross_profit']}, margin_pct={res['margin_pct']}, formula={res['formula']}"
+    elif metric == "net_margin":
+        val_txt = _format_num(res["margin_pct"], indonesian)
+        ans = (
+            f"Margin bersih: {val_txt}%.\n\nAudit pos biaya operasional terbesar dan pantau rasio margin bersih bulanan."
+            if indonesian else
+            f"Net margin: {val_txt}%.\n\nAudit the largest operating expense lines and monitor monthly net margin ratio."
+        )
+        note = f"kpi(net_margin): {inputs_trace}; net_profit={res['net_profit']}, margin_pct={res['margin_pct']}, formula={res['formula']}"
+    elif metric == "conversion_rate":
+        val_txt = _format_num(res["rate_pct"], indonesian)
+        ans = (
+            f"Tingkat konversi: {val_txt}%.\n\nCatat alasan utama pengunjung tidak membeli dan ukur tingkat konversi harian."
+            if indonesian else
+            f"Conversion rate: {val_txt}%.\n\nLog why non-buying visitors leave and monitor daily conversion rate."
+        )
+        note = f"kpi(conversion_rate): {inputs_trace}; rate_pct={res['rate_pct']}, formula={res['formula']}"
+    elif metric == "breakeven_units":
+        units_int = res["units"]
+        ans = (
+            f"Titik impas: {units_int} unit.\n\nPeriksa selisih penjualan mingguan terhadap target dan pantau rasio margin kontribusi."
+            if indonesian else
+            f"Break-even volume: {units_int} units.\n\nReview weekly unit sales variance against the threshold and track contribution margin ratio."
+        )
+        note = f"kpi(breakeven_units): {inputs_trace}; contribution_margin={res['contribution_margin']}, units={units_int}, formula={res['formula']}"
+    elif metric == "aov":
+        val_txt = _format_num(res["aov"], indonesian)
+        ans = (
+            f"Rata-rata nilai pesanan (AOV): {val_txt}.\n\nUji paket pendamping pada produk utama dan pantau rata-rata per pesanan mingguan."
+            if indonesian else
+            f"Average order value (AOV): {val_txt}.\n\nTest a complementary bundle on top items and track average revenue per order."
+        )
+        note = f"kpi(aov): {inputs_trace}; aov={res['aov']}, formula={res['formula']}"
+    else:  # roi
+        val_txt = _format_num(res["roi_pct"], indonesian)
+        ans = (
+            f"ROI: {val_txt}%.\n\nUji ulang kampanye pada segmen berintent tinggi dan pantau rasio ROI bersih."
+            if indonesian else
+            f"ROI: {val_txt}%.\n\nRe-test the campaign on a high-intent segment and track net ROI ratio."
+        )
+        note = f"kpi(roi): {inputs_trace}; net_gain={res['net_gain']}, roi_pct={res['roi_pct']}, formula={res['formula']}"
+
+    return AgentResult(answer=ans, notes=note, sources=[{"title": "tool:kpi", "url": ""}])
+
+
+class ContextLimitError(ValueError):
+    """The newest user turn does not fit even without history."""
 
 
 class KuonAgent:
@@ -116,6 +691,143 @@ class KuonAgent:
 
     # ---------------------------------------------------------------- loop
 
+    def advise(self, messages: list[tuple[str, str]]) -> AgentResult:
+        # The user's business facts come from the chat, optional client documents
+        # (BM25 RAG), and deterministic analytical tools (never public web guesses).
+        fits = getattr(self.engine, "prompt_fits", None)
+        if fits is None:
+            raise NotImplementedError("Business chat requires an engine with token budgeting.")
+
+        turns: list[list[str]] = []
+        user_msgs: list[str] = []
+        latest_user_text = ""
+        for role, content in messages:
+            if role == "user":
+                turns.append([f"User: {content}"])
+                user_msgs.append(content)
+                latest_user_text = content
+            elif role == "assistant" and turns:
+                turns[-1].append(f"Assistant: {content}")
+
+        ledger = FactLedger()
+        sources: list[dict] = []
+        tool_notes: list[str] = []
+
+        # Detect language from latest user turn, falling back to prior user turn for numeric follow-ups
+        indonesian = bool(_ID_WORDS.search(latest_user_text)) or (
+            not re.search(r"[A-Za-z]{3,}", latest_user_text)
+            and any(_ID_WORDS.search(m) for m in user_msgs[:-1])
+        )
+
+        # 1. Deterministic grounded sales-table comparison & direct KPI calculation (multi-turn aware)
+        sales_answer = _answer_sales_change(user_msgs, indonesian)
+        if sales_answer is not None:
+            return sales_answer
+
+        embedded_tbl = _extract_embedded_table(latest_user_text)
+        if not embedded_tbl:
+            kpi_answer = _answer_direct_kpi(user_msgs, indonesian)
+            if kpi_answer is not None:
+                return kpi_answer
+
+        if embedded_tbl:
+            try:
+                summary = summarize_table(embedded_tbl)
+                if summary["numeric_summary"]:
+                    bits = []
+                    for col, st in summary["numeric_summary"].items():
+                        delta = (f", delta={st['first_to_last_delta']} ({st['first_to_last_pct']}%)"
+                                 if "first_to_last_pct" in st else "")
+                        bits.append(f"{col}: sum={st['sum']}, mean={st['mean']}, min={st['min']}, max={st['max']}{delta}")
+                    note = f"Table ({summary['row_count']} rows) — " + "; ".join(bits)
+                    ledger.add(note, source="tool:table_summary")
+                    sources.append({"title": "tool:table_summary", "url": ""})
+                    tool_notes.append(note)
+            except ValueError:
+                pass
+
+        # 2. Optional client document retrieval (only when the operator loaded a RAG index)
+        if self.cfg.use_rag and self.rag is not None and latest_user_text:
+            for _score, chunk in self.rag.search(latest_user_text, top_k=min(2, self.cfg.top_k_rag)):
+                snippet = chunk.text[:350].strip()
+                if snippet:
+                    ledger.add(snippet, source=chunk.source)
+                    sources.append({"title": chunk.source, "url": ""})
+
+        max_tokens = min(180, self.cfg.max_answer_tokens)
+
+        def _build_fitting_prompt(evidence_text: str | None) -> str:
+            conversation = "\n".join(turns[-1])
+            prompt = format_prompt(
+                conversation.removeprefix("User: "),
+                evidence=evidence_text,
+                business=True,
+            )
+            if not fits(prompt, max_tokens):
+                # Fall back to dropping evidence if client message alone barely fits
+                if evidence_text is not None:
+                    prompt = format_prompt(conversation.removeprefix("User: "), business=True)
+                if not fits(prompt, max_tokens):
+                    raise ContextLimitError
+                return prompt
+            for turn in reversed(turns[:-1]):
+                candidate = "\n".join([*turn, conversation])
+                expanded = format_prompt(
+                    candidate.removeprefix("User: "),
+                    evidence=evidence_text,
+                    business=True,
+                )
+                if not fits(expanded, max_tokens):
+                    break
+                conversation, prompt = candidate, expanded
+            return prompt
+
+        ev_text = ledger.format_evidence() or None
+        prompt = _build_fitting_prompt(ev_text)
+        answer = self.engine.complete(prompt, max_tokens=max_tokens).strip()
+
+        # 3. Single bounded deterministic tool-call pass with strict argument provenance check
+        match = _TOOL_CALL_RE.search(answer)
+        if match:
+            grounded_context = "\n".join(user_msgs) + "\n" + ledger.format_evidence()
+            allowed_nums = extract_grounded_numbers(grounded_context)
+            bound_fields = _extract_labeled_fields(user_msgs)
+            tool_out, err_note = _execute_tool_call(
+                match.group(1),
+                match.group(2),
+                allowed_numbers=allowed_nums,
+                bound_fields=bound_fields,
+            )
+            if tool_out is None:
+                if err_note:
+                    tool_notes.append(err_note)
+                answer = (
+                    "Saya belum bisa memverifikasi hitungan ini karena angka masukan belum cocok dengan data yang Anda berikan. Bisa konfirmasi ukuran, angka, dan satuannya?"
+                    if indonesian else
+                    "I couldn't verify that calculation because the figures didn't match your stated data. Which metric, figures, and units should I use?"
+                )
+            else:
+                source = f"tool:{match.group(1).lower()}"
+                ledger.add(tool_out, source=source)
+                sources.append({"title": source, "url": ""})
+                tool_notes.append(tool_out)
+                answer = self.engine.complete(_build_fitting_prompt(ledger.format_evidence()), max_tokens=max_tokens).strip()
+
+        # 4. Post-generation grounding verification whenever external/tool evidence was supplied
+        final_ev = ledger.format_evidence()
+        if final_ev:
+            ok, safe_fallback = verify_grounded_answer(
+                latest_user_text, final_ev, answer, indonesian=indonesian
+            )
+            if not ok and safe_fallback:
+                answer = safe_fallback
+
+        return AgentResult(
+            answer=answer,
+            notes="\n".join(tool_notes),
+            sources=sources,
+        )
+
     def answer(self, question: str) -> AgentResult:
         if is_smalltalk(question):
             # answer in the model's own chat format, without search
@@ -149,9 +861,13 @@ class KuonAgent:
             ).strip()
 
         answer = self.engine.complete(
-            ANSWER_PROMPT.format(question=question, evidence=evidence),
+            format_prompt(question, evidence=evidence),
             max_tokens=self.cfg.max_answer_tokens,
         ).strip()
+        indonesian = bool(_ID_WORDS.search(question))
+        ok, safe_fallback = verify_grounded_answer(question, evidence, answer, indonesian=indonesian)
+        if not ok and safe_fallback:
+            answer = safe_fallback
 
         return AgentResult(
             answer=answer,

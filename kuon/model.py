@@ -209,7 +209,6 @@ class Transformer(nn.Module):
         else:
             schedule = list(range(cfg.n_layer))
         self._schedule = schedule
-
         # weight init: N(0, 0.02) everywhere, except residual-out projections
         # which get N(0, 0.02/sqrt(2*n_layer)) to keep the residual stream's
         # variance from growing with depth (GPT-2/nanoGPT convention).
@@ -226,6 +225,18 @@ class Transformer(nn.Module):
             if name.endswith(("o_proj.weight", "down_proj.weight")):
                 nn.init.normal_(p, mean=0.0, std=scaled)
 
+        # Initialize after the shared blocks so all variants start with the same weights.
+        self.loop_gate = None
+        if cfg.looping and cfg.loop_gate_rank:
+            self.loop_gate = nn.Sequential(
+                nn.Linear(cfg.n_embd, cfg.loop_gate_rank, bias=False),
+                nn.SiLU(),
+                nn.Linear(cfg.loop_gate_rank, cfg.n_embd, bias=False),
+                nn.Tanh(),
+            )
+            nn.init.normal_(self.loop_gate[0].weight, mean=0.0, std=0.02)
+            nn.init.zeros_(self.loop_gate[2].weight)
+
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None,
                 cache: list[KVCache] | None = None):
         """idx: (B, T) int64 tokens, T <= block_size.
@@ -239,14 +250,21 @@ class Transformer(nn.Module):
         assert T <= self.cfg.block_size, f"context {T} > block_size {self.cfg.block_size}"
 
         x = self.drop(self.embed(idx))
-        if cache is not None and self.cfg.looping:
-            raise NotImplementedError(
-                "KV cache is not supported for looped models; "
-                "call generate() which falls back to no-cache decoding")
-        for layer_idx in self._schedule:
+        if cache is not None:
+            assert len(cache) == len(self._schedule), (
+                f"expected {len(self._schedule)} KV caches, got {len(cache)}")
+        prelude = x
+        for execution_idx, layer_idx in enumerate(self._schedule):
+            if self.loop_gate is not None and layer_idx == self.cfg.loop_start:
+                if execution_idx == self.cfg.loop_start:
+                    prelude = x
+                else:
+                    # Token-local message from the previous pass. At init the
+                    # closed gate makes this exactly the same as one pass.
+                    x = prelude + self.loop_gate(prelude) * (x - prelude)
             block = self.blocks[layer_idx]
             x = block(x, self.rope_cos, self.rope_sin,
-                      cache[layer_idx] if cache is not None else None)
+                      cache[execution_idx] if cache is not None else None)
         x = self.norm_f(x)
         logits = self.lm_head(x)
 

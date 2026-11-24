@@ -47,10 +47,42 @@ def sample_from_logits(logits: torch.Tensor, temperature: float = 0.8,
     return torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
 
 
+def _apply_repetition_controls(
+    logits: torch.Tensor,
+    generated: list[list[int]],
+    repetition_penalty: float = 1.0,
+    no_repeat_ngram_size: int = 0,
+) -> torch.Tensor:
+    """Apply Keskar-style repetition penalty and n-gram blocking on generated tokens only."""
+    if repetition_penalty == 1.0 and no_repeat_ngram_size <= 0:
+        return logits
+    out = logits.clone()
+    for row, seq in enumerate(generated):
+        if not seq:
+            continue
+        if repetition_penalty > 1.0:
+            for tid in set(seq):
+                if out[row, tid] > 0:
+                    out[row, tid] /= repetition_penalty
+                else:
+                    out[row, tid] *= repetition_penalty
+        if no_repeat_ngram_size >= 2 and len(seq) >= no_repeat_ngram_size - 1:
+            n = no_repeat_ngram_size
+            prefix = tuple(seq[-(n - 1):])
+            banned: set[int] = set()
+            for idx in range(len(seq) - n + 1):
+                if tuple(seq[idx:idx + n - 1]) == prefix:
+                    banned.add(seq[idx + n - 1])
+            for tid in banned:
+                out[row, tid] = float("-inf")
+    return out
+
+
 @torch.no_grad()
 def generate(model, prompt_ids: torch.Tensor, max_new_tokens: int = 128,
              temperature: float = 0.8, top_k: int = 50, top_p: float = 0.9,
-             eos_id: int | None = None):
+             eos_id: int | None = None, repetition_penalty: float = 1.0,
+             no_repeat_ngram_size: int = 0):
     """Yield lists of new token ids (one per batch row) for up to
     max_new_tokens. Stops early when every row has produced eos_id."""
     model.eval()
@@ -59,38 +91,32 @@ def generate(model, prompt_ids: torch.Tensor, max_new_tokens: int = 128,
     block = cfg.block_size
     dtype = next(model.parameters()).dtype
 
-    if cfg.looping:
-        # recurrent depth: KV cache doesn't map cleanly onto repeated passes,
-        # so recompute the window each step (fine for experiments/tiny models)
-        ids = prompt_ids[:, -block:]
-        for _ in range(max_new_tokens):
-            logits, _ = model(ids)
-            nxt = sample_from_logits(logits[:, -1, :], temperature, top_k, top_p)
-            tok = nxt[:, 0].tolist()
-            yield tok
-            if eos_id is not None and tok.count(eos_id) == len(tok):
-                return
-            ids = torch.cat([ids, nxt], dim=1)[:, -block:]
-        return
-
     def fresh_caches():
         return [KVCache(prompt_ids.size(0), block, cfg.n_kv_head, cfg.head_dim,
-                        dtype, device) for _ in range(cfg.n_layer)]
+                        dtype, device) for _ in range(cfg.n_exec_layers)]
 
     ids = prompt_ids[:, -block:]
     caches = fresh_caches()
     logits, _ = model(ids, cache=caches)   # prefill the prompt once
+    generated: list[list[int]] = [[] for _ in range(prompt_ids.size(0))]
 
     for _ in range(max_new_tokens):
-        nxt = sample_from_logits(logits[:, -1, :], temperature, top_k, top_p)  # (B, 1)
+        step_logits = _apply_repetition_controls(
+            logits[:, -1, :], generated, repetition_penalty, no_repeat_ngram_size
+        )
+        nxt = sample_from_logits(step_logits, temperature, top_k, top_p)  # (B, 1)
         tok = nxt[:, 0].tolist()
+        for row, tid in enumerate(tok):
+            generated[row].append(tid)
         yield tok
         if eos_id is not None and tok.count(eos_id) == len(tok):
             return
 
+        ids = torch.cat([ids, nxt], dim=1)[:, -block:]
         if caches[0].len + 1 > block:
-            # context is full: slide the window and rebuild the cache
-            ids = torch.cat([ids, nxt], dim=1)[:, -block:]
+            # context is full: slide the window by half a block so we don't
+            # rebuild a full-block prefill on every subsequent decode token.
+            ids = ids[:, -(block // 2):]
             caches = fresh_caches()
             logits, _ = model(ids, cache=caches)
         else:

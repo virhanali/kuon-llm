@@ -18,6 +18,7 @@ Design (GPT-2 lineage, Llama-style byte fallback):
 from __future__ import annotations
 
 import codecs
+import heapq
 import json
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -164,34 +165,49 @@ class BPETokenizer:
                 pair_stats[(a, b)] += f
                 pair_to_words[(a, b)].add(w)
 
-        # 4) merge loop: repeatedly take the most frequent pair
+        # 4) merge loop: lazy max-heap gives O(log P) selection instead of O(P) scan
+        heap: list[tuple[int, tuple[int, int]]] = [
+            (-cnt, pair) for pair, cnt in pair_stats.items() if cnt > 0
+        ]
+        heapq.heapify(heap)
         n_merges = vocab_size - 256 - len(specials)
         merges: list[tuple[int, int]] = []
         vocab: list[bytes] = [bytes([i]) for i in range(256)]
-        while len(merges) < n_merges and pair_stats:
-            best, cnt = max(pair_stats.items(), key=lambda kv: kv[1])
-            if cnt <= 0:
-                # only stale (zero) entries remain; nothing left to merge
-                break
+        while len(merges) < n_merges and heap:
+            neg_cnt, best = heapq.heappop(heap)
+            cnt = pair_stats.get(best, 0)
+            if cnt <= 0 or cnt != -neg_cnt:
+                continue
 
             new_id = 256 + len(merges)
             merges.append(best)
             vocab.append(vocab[best[0]] + vocab[best[1]])
 
+            touched: set[tuple[int, int]] = set()
             for w in list(pair_to_words.get(best, ())):
                 seq = seqs[w]
                 f = word_freq[w]
                 # remove this word's old pair contributions
                 for a, b in zip(seq, seq[1:]):
                     pair_stats[(a, b)] -= f
+                    touched.add((a, b))
                 seq = _merge_seq(seq, best, new_id)
                 seqs[w] = seq
                 # add the new (post-merge) pair contributions
                 for a, b in zip(seq, seq[1:]):
                     pair_stats[(a, b)] += f
                     pair_to_words[(a, b)].add(w)
+                    touched.add((a, b))
             pair_stats.pop(best, None)
             pair_to_words.pop(best, None)
+            touched.discard(best)
+            for pair in touched:
+                updated = pair_stats.get(pair, 0)
+                if updated > 0:
+                    heapq.heappush(heap, (-updated, pair))
+                else:
+                    pair_stats.pop(pair, None)
+                    pair_to_words.pop(pair, None)
 
             if verbose and len(merges) % 1000 == 0:
                 print(f"[tokenizer] {len(merges)}/{n_merges} merges")

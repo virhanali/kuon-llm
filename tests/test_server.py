@@ -92,6 +92,10 @@ def test_streaming_sse():
         assert "chat.completion.chunk" in raw
         assert "answer to: hi" in raw
         assert "data: [DONE]" in raw
+        frames = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
+        stop_frame = next(f for f in frames if f["choices"][0]["finish_reason"] == "stop")
+        assert stop_frame["x_notes"] == "stub notes"
+        assert stop_frame["x_sources"][0]["title"] == "Injected source"
         conn.close()
 
     with_server(check)
@@ -104,6 +108,8 @@ def test_homepage_serves_chat_ui():
         html = conn.getresponse().read().decode()
         assert "Kuon Studio" in html
         assert "/v1/chat/completions" in html
+        assert "x_kuon_mode" in html
+        assert "x_notes" in html
         conn.close()
 
     with_server(check)

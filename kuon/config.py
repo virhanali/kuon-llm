@@ -37,21 +37,29 @@ class ModelConfig:
     dropout: float = 0.0         # keep 0.0 for small models / CPU training
     tie_word_embeddings: bool = True
 
-    # Looped transformer (recurrent depth, Inkling 2 Mini style): the block
+    # Looped transformer (recurrent depth): the block
     # range [loop_start, loop_end) is executed `loop_passes` times per token,
     # reusing the same weights. loop_end <= loop_start disables looping.
     loop_start: int = 0
     loop_end: int = 0
     loop_passes: int = 1
+    loop_gate_rank: int = 0      # > 0: restart each pass with prelude + gated message
 
     def __post_init__(self) -> None:
         assert 0 <= self.loop_start <= self.loop_end <= self.n_layer, (
             f"invalid loop range [{self.loop_start}, {self.loop_end}) for {self.n_layer} layers")
         assert self.loop_passes >= 1, "loop_passes must be >= 1"
+        assert 0 <= self.loop_gate_rank <= self.n_embd, "invalid loop gate rank"
 
     @property
     def looping(self) -> bool:
         return self.loop_passes > 1 and self.loop_end > self.loop_start
+
+    @property
+    def n_exec_layers(self) -> int:
+        if self.looping:
+            return self.n_layer + (self.loop_passes - 1) * (self.loop_end - self.loop_start)
+        return self.n_layer
 
     @property
     def head_dim(self) -> int:

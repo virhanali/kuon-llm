@@ -24,7 +24,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from kuon_agent.agent import AgentConfig, KuonAgent
+from kuon_agent.agent import AgentConfig, ContextLimitError, KuonAgent
 from kuon_agent.llm import KuonEngine, LlamaCppEngine, MockEngine, OllamaEngine
 from kuon_agent.rag import BM25Index
 
@@ -38,22 +38,25 @@ INDEX_HTML = """<!doctype html>
   :root { --bg:#0b0e14; --panel:#121722; --line:#1f2733; --text:#e6edf3; --dim:#8b98a9; --accent:#7c9cff; }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--text); font:16px/1.6 ui-sans-serif,system-ui,Segoe UI,Roboto,sans-serif; }
-  header { padding:18px 22px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:12px; }
+  header { padding:18px 22px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
   header h1 { margin:0; font-size:18px; letter-spacing:.4px; }
   header span { color:var(--dim); font-size:13px; }
-  main { max-width:820px; margin:0 auto; padding:22px 16px 140px; }
+  .controls { margin-left:auto; display:flex; gap:8px; align-items:center; }
+  .controls select, .controls button { background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:6px 10px; font-size:13px; cursor:pointer; }
+  main { max-width:820px; margin:0 auto; padding:22px 16px 160px; }
   .msg { margin:14px 0; display:flex; gap:10px; }
   .msg .who { color:var(--dim); font-size:12px; min-width:64px; padding-top:4px; text-transform:uppercase; letter-spacing:.8px; }
   .bubble { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px 14px; white-space:pre-wrap; flex:1; }
   .msg.user .bubble { background:#101827; }
-  .sources { margin-top:10px; font-size:13px; color:var(--dim); }
+  .notes { margin-top:10px; padding:8px 10px; background:#0d131d; border:1px solid var(--line); border-radius:8px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; color:#9db4d8; }
+  .sources { margin-top:8px; font-size:13px; color:var(--dim); }
   .sources a { color:var(--accent); text-decoration:none; }
   .sources div { margin-top:4px; }
   footer { position:fixed; bottom:0; left:0; right:0; background:linear-gradient(transparent, var(--bg) 30%); padding:20px 16px 24px; }
-  .composer { max-width:820px; margin:0 auto; display:flex; gap:10px; }
-  input[type=text] { flex:1; background:var(--panel); border:1px solid var(--line); color:var(--text); border-radius:12px; padding:14px 16px; font-size:16px; outline:none; }
-  input[type=text]:focus { border-color:#33415c; }
-  button { background:var(--accent); color:#0b0e14; border:0; border-radius:12px; padding:0 22px; font-weight:600; cursor:pointer; }
+  .composer { max-width:820px; margin:0 auto; display:flex; gap:10px; align-items:flex-end; }
+  textarea { flex:1; background:var(--panel); border:1px solid var(--line); color:var(--text); border-radius:12px; padding:12px 14px; font:15px/1.5 ui-sans-serif,system-ui,Segoe UI,Roboto,sans-serif; outline:none; resize:vertical; min-height:52px; max-height:180px; }
+  textarea:focus { border-color:#33415c; }
+  .composer button { background:var(--accent); color:#0b0e14; border:0; border-radius:12px; padding:14px 22px; font-weight:600; cursor:pointer; }
   button:disabled { opacity:.5; cursor:default; }
   .hint { max-width:820px; margin:8px auto 0; color:var(--dim); font-size:12px; }
 </style>
@@ -61,25 +64,35 @@ INDEX_HTML = """<!doctype html>
 <body>
 <header>
   <h1>Kuon Studio</h1>
-  <span>from-scratch agent &mdash; search &rarr; think &rarr; answer, with sources</span>
+  <span>from-scratch business &amp; evidence agent &mdash; verify &rarr; compute &rarr; answer</span>
+  <div class="controls">
+    <select id="mode" aria-label="Chat mode">
+      <option value="business" selected>Business chat</option>
+      <option value="general">General QA</option>
+    </select>
+    <button id="reset" type="button">Reset</button>
+  </div>
 </header>
 <main id="chat">
   <div class="msg assistant">
     <div class="who">Kuon</div>
-    <div class="bubble">Halo! Tanyakan apa saja. Aku mencari bukti dulu (Wikipedia / index lokal), lalu menjawab dari bukti itu dengan sitasi.</div>
+    <div class="bubble">Halo! Tempel tabel penjualan atau data bisnis Anda. Kuon memeriksa angka, menghitung dengan rumus pasti, dan menampilkan sumber buktinya.</div>
   </div>
 </main>
 <footer>
   <div class="composer">
-    <input id="q" type="text" placeholder="who is mr beast?" autocomplete="off">
+    <textarea id="q" rows="2" placeholder="Tempel tabel omzet atau tanyakan KPI bisnis (Shift+Enter untuk baris baru)..."></textarea>
     <button id="send">Kirim</button>
   </div>
-  <div class="hint">Jawaban hanya dari sumber. Tanpa bukti, Kuon akan bilang tidak tahu.</div>
+  <div class="hint">Jawaban hanya dari bukti dan alat hitung. Tanpa data yang cukup, Kuon akan meminta klarifikasi.</div>
 </footer>
 <script>
 const chat = document.getElementById('chat');
 const input = document.getElementById('q');
 const send = document.getElementById('send');
+const modeSel = document.getElementById('mode');
+const resetBtn = document.getElementById('reset');
+const history = [];
 
 function addMessage(role, text) {
   const wrap = document.createElement('div');
@@ -92,7 +105,13 @@ function addMessage(role, text) {
   return wrap.querySelector('.bubble');
 }
 
-function addSources(bubble, sources) {
+function addProvenance(bubble, notes, sources) {
+  if (notes) {
+    const n = document.createElement('div');
+    n.className = 'notes';
+    n.textContent = notes;
+    bubble.appendChild(n);
+  }
   if (!sources || !sources.length) return;
   const box = document.createElement('div');
   box.className = 'sources';
@@ -113,21 +132,32 @@ function addSources(bubble, sources) {
 
 async function ask() {
   const question = input.value.trim();
-  if (!question) return;
+  if (!question || send.disabled) return;
   input.value = '';
   send.disabled = true;
   addMessage('user', question);
+  history.push({role: 'user', content: question});
   const bubble = addMessage('assistant', '…');
   try {
+    const req = {model: 'kuon-agent', messages: history.slice()};
+    if (modeSel.value === 'business') req.x_kuon_mode = 'business';
     const response = await fetch('/v1/chat/completions', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({model: 'kuon-agent', messages: [{role: 'user', content: question}]})
+      body: JSON.stringify(req)
     });
     const data = await response.json();
-    bubble.textContent = data.choices[0].message.content;
-    addSources(bubble, data.x_sources || []);
+    if (!response.ok) {
+      history.pop();
+      bubble.textContent = data.error?.message || 'Could not answer. Please try again.';
+      return;
+    }
+    const content = data.choices[0].message.content;
+    history.push({role: 'assistant', content});
+    bubble.textContent = content;
+    addProvenance(bubble, data.x_notes || '', data.x_sources || []);
   } catch (error) {
+    history.pop();
     bubble.textContent = 'Error: ' + error;
   } finally {
     send.disabled = false;
@@ -135,8 +165,19 @@ async function ask() {
   }
 }
 
+resetBtn.addEventListener('click', () => {
+  history.length = 0;
+  chat.innerHTML = '';
+  addMessage('assistant', 'Percakapan direset. Silakan kirim tabel atau pertanyaan bisnis baru.');
+  input.focus();
+});
 send.addEventListener('click', ask);
-input.addEventListener('keydown', (event) => { if (event.key === 'Enter') ask(); });
+input.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && !event.shiftKey) {
+    event.preventDefault();
+    ask();
+  }
+});
 input.focus();
 </script>
 </body>
@@ -217,15 +258,34 @@ def build_handler(agent, model_name: str = "kuon-agent",
                 length = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(length) or b"{}")
                 messages = payload.get("messages", [])
-                question = next((_content_of(m) for m in reversed(messages)
-                                 if m.get("role") == "user"), "")
+                user_index = next((i for i in range(len(messages) - 1, -1, -1)
+                                   if messages[i].get("role") == "user"), -1)
+                question = _content_of(messages[user_index]).strip() if user_index >= 0 else ""
                 if not question:
                     self._json(400, {"error": {"message": "no user message"}})
                     return
 
                 requested = payload.get("model") or model_name
                 chosen = registry.get(requested, agent)
-                result = chosen.answer(question)
+                if payload.get("x_kuon_mode") == "business":
+                    history = [(m["role"], _content_of(m).strip())
+                               for m in messages[:user_index + 1]
+                               if m.get("role") in ("user", "assistant")]
+                    try:
+                        result = chosen.advise(history)
+                    except ContextLimitError:
+                        self._json(400, {"error": {
+                            "code": "context_length_exceeded",
+                            "message": "The latest message exceeds the token budget. Shorten it and try again.",
+                        }})
+                        return
+                    except NotImplementedError:
+                        self._json(501, {"error": {
+                            "message": "Business chat is unavailable on the selected engine.",
+                        }})
+                        return
+                else:
+                    result = chosen.answer(question)
                 if payload.get("stream"):
                     self._stream(result, question, requested)
                 else:
@@ -267,18 +327,20 @@ def build_handler(agent, model_name: str = "kuon-agent",
             self._cors()
             self.end_headers()
 
-            def chunk(delta: dict, finish=None):
+            def chunk(delta: dict, finish=None, extra: dict | None = None):
                 frame = {
                     "id": completion_id, "object": "chat.completion.chunk",
                     "created": created, "model": model_id or model_name,
                     "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
                 }
+                if extra:
+                    frame.update(extra)
                 self.wfile.write(b"data: " + json.dumps(frame).encode() + b"\n\n")
                 self.wfile.flush()
 
             chunk({"role": "assistant"})
             chunk({"content": result.answer})
-            chunk({}, "stop")
+            chunk({}, "stop", {"x_sources": result.sources, "x_notes": result.notes})
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
 

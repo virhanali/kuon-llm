@@ -18,10 +18,11 @@ import json
 import multiprocessing as mp
 import random
 import shutil
+from itertools import islice
 from pathlib import Path
 
-import numpy as np
 import torch
+import numpy as np
 
 
 def open_bin(data_dir: str | Path, split: str = "train") -> np.memmap:
@@ -49,18 +50,18 @@ class BinWriter:
         self.f.close()
 
 
-def get_batch(data: np.memmap, block_size: int, batch_size: int, device: str = "cpu"):
+def get_batch(data: np.memmap, block_size: int, batch_size: int, device: str = "cpu",
+              *, rng: np.random.Generator | None = None):
     """Sample one random (input, target) crop per row from the token stream.
 
     Inputs are tokens [i, i+block); targets are the same window shifted by
     one: exactly the next-token prediction objective."""
     max_start = len(data) - block_size - 1
     assert max_start > 0, "dataset too small for this block size"
-    ix = np.random.randint(0, max_start, size=batch_size)
-    x = torch.tensor(np.stack([data[i:i + block_size] for i in ix]).astype(np.int64),
-                     dtype=torch.long)
-    y = torch.tensor(np.stack([data[i + 1:i + 1 + block_size] for i in ix]).astype(np.int64),
-                     dtype=torch.long)
+    ix = (np.random.randint if rng is None else rng.integers)(0, max_start, size=batch_size)
+    buf = torch.from_numpy(np.stack([data[i:i + block_size + 1] for i in ix]).astype(np.int64))
+    x = buf[:, :-1].contiguous()
+    y = buf[:, 1:].contiguous()
     if device != "cpu":
         x = x.pin_memory().to(device, non_blocking=True)
         y = y.pin_memory().to(device, non_blocking=True)
@@ -123,14 +124,16 @@ def iter_documents(path: str | Path):
 
 def pack_corpus(input_path: str | Path, tokenizer_path: str | Path, out_dir: str | Path,
                 val_docs: int = 500, workers: int = 2, max_tokens: int | None = None,
-                verbose: bool = True) -> dict:
+                verbose: bool = True, *, val_input: str | Path | None = None) -> dict:
     """Stream a large text file into train.bin / val.bin (+ tokenizer + meta).
 
-    Documents are blank-line separated; the first `val_docs` documents become
-    validation. `max_tokens` caps the TRAIN token count. RAM stays flat.
+    With `val_input`, use a separate held-out corpus. Otherwise the first
+    `val_docs` documents become validation. `max_tokens` caps the train stream.
     """
     from kuon.tokenizer import BPETokenizer
 
+    if val_input is not None and Path(val_input).resolve() == Path(input_path).resolve():
+        raise ValueError("validation input must be separate from the training input")
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     shutil.copy(tokenizer_path, out / "tokenizer.json")
@@ -141,6 +144,12 @@ def pack_corpus(input_path: str | Path, tokenizer_path: str | Path, out_dir: str
     pool = None
     n_docs = 0
     try:
+        if val_input is not None:
+            for doc in islice(iter_documents(val_input), val_docs):
+                val_writer.write(tokenizer.encode(doc, add_eos=True))
+                n_docs += 1
+            if n_docs == 0:
+                raise ValueError("validation input has no documents")
         if workers > 1:
             pool = mp.Pool(workers, initializer=_pack_init, initargs=(str(tokenizer_path),))
             encoded = pool.imap(_pack_encode, iter_documents(input_path), chunksize=128)
@@ -149,7 +158,7 @@ def pack_corpus(input_path: str | Path, tokenizer_path: str | Path, out_dir: str
             encoded = map(_pack_encode, iter_documents(input_path))
 
         for ids in encoded:
-            (val_writer if n_docs < val_docs else train_writer).write(ids)
+            (val_writer if val_input is None and n_docs < val_docs else train_writer).write(ids)
             n_docs += 1
             if verbose and n_docs % 20000 == 0:
                 print(f"[pack] {n_docs:,} docs | train {train_writer.n_tokens:,} tokens", flush=True)
@@ -168,9 +177,10 @@ def pack_corpus(input_path: str | Path, tokenizer_path: str | Path, out_dir: str
         "train_tokens": train_writer.n_tokens,
         "val_tokens": val_writer.n_tokens,
     }
+    if val_input is not None:
+        meta["val_source"] = str(val_input)
     (out / "meta.json").write_text(json.dumps(meta))
     if verbose:
         print(f"[pack] done: {n_docs:,} docs | train {train_writer.n_tokens:,} | "
               f"val {val_writer.n_tokens:,} -> {out}")
     return meta
-

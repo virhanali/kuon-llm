@@ -1,10 +1,15 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 .ipynb_checkpoints/
+*.egg-info/
 data/
 checkpoints/
 logs/
+*.bin
 *.gguf
 *.pt
 *.zip
+.DS_Store

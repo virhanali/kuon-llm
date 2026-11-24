@@ -20,12 +20,13 @@ def main() -> None:
     ap.add_argument("--tokenizer", required=True)
     ap.add_argument("--out", default="data/cosmopedia")
     ap.add_argument("--val-docs", type=int, default=500)
+    ap.add_argument("--val-input", help="separate held-out text, excluded from --input")
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--max-tokens", type=int, default=None)
     args = ap.parse_args()
 
     pack_corpus(args.input, args.tokenizer, args.out, val_docs=args.val_docs,
-                workers=args.workers, max_tokens=args.max_tokens)
+                workers=args.workers, max_tokens=args.max_tokens, val_input=args.val_input)
 
 
 if __name__ == "__main__":
