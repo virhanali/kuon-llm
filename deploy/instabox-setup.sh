@@ -34,7 +34,7 @@ fi
 echo "[instabox] Installing CPU-only PyTorch (~250 MB), tokenizers, onnxruntime, and Kuon package..."
 "$APP_DIR/venv/bin/pip" install --no-cache-dir --upgrade pip
 "$APP_DIR/venv/bin/pip" install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
-"$APP_DIR/venv/bin/pip" install --no-cache-dir tokenizers onnxruntime
+"$APP_DIR/venv/bin/pip" install --no-cache-dir tokenizers onnxruntime regex
 "$APP_DIR/venv/bin/pip" install --no-cache-dir --no-deps -e .
 
 mkdir -p "$CKPT_DIR"
@@ -44,7 +44,7 @@ if [[ ! -f "$CKPT_DIR/$CKPT_FILE" ]]; then
     echo "[instabox] Set KUON_KAGGLE_DATASET and KAGGLE_API_TOKEN (in InstaBox Secrets), or copy checkpoint manually."
     exit 1
   fi
-  "$APP_DIR/venv/bin/pip" install --no-cache-dir kaggle
+  "$APP_DIR/venv/bin/pip" install --no-cache-dir kaggle six
   mkdir -p "$HOME/.kaggle"
   printf '%s\n' "$KAGGLE_API_TOKEN" > "$HOME/.kaggle/access_token"
   chmod 600 "$HOME/.kaggle/access_token"
