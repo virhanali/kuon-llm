@@ -215,3 +215,48 @@ def test_capability_open_symptom_and_multiturn_table_to_kpi_transition():
         ("user", turn3),
     ])
     assert "30%" in r3.answer
+
+
+def test_fusion_chat_engine_reasons_freely_and_preserves_exact_kpi():
+    class FakeChatEngine:
+        name = "kuon-fusion"
+        supports_chat = True
+
+        def __init__(self):
+            self.calls: list[list[dict]] = []
+
+        def prompt_fits(self, prompt: str, max_tokens: int = 256) -> bool:
+            return True
+
+        def chat(self, messages: list[dict], max_tokens: int = 320, *, temperature=None) -> str:
+            self.calls.append(messages)
+            return "Jawaban alami dari Kuon."
+
+    eng = FakeChatEngine()
+    web_queries: list[str] = []
+    agent = KuonAgent(
+        eng,
+        AgentConfig(use_wiki=False, use_web=True),
+        rag_index=make_index(),
+        web_fn=lambda q, n: (web_queries.append(q) or [Source(title="News", url="https://news.test", text="Prabowo Presiden RI.")]),
+    )
+
+    # Self-referential / open questions skip web search and go to reasoning engine directly
+    r_skill = agent.answer("ilmu kamu apa aja?")
+    assert web_queries == []
+    assert r_skill.answer == "Jawaban alami dari Kuon."
+
+    r_sym = agent.advise([("user", "bisnis ku lesu")])
+    assert r_sym.answer == "Jawaban alami dari Kuon."
+
+    # External factual question DOES trigger live web search and passes evidence into system prompt
+    r_web = agent.answer("Siapa presiden Indonesia sekarang?")
+    assert web_queries == ["Siapa presiden Indonesia sekarang?"]
+    assert r_web.sources and r_web.sources[0]["url"] == "https://news.test"
+    assert "[Bukti Web]" in eng.calls[-1][0]["content"]
+
+    # Deterministic table math STILL computes exact numbers without calling LLM
+    prev_calls = len(eng.calls)
+    r_tsv = agent.advise([("user", "Produk\tOmzet\nKopi\t10000000\nMatcha\t30000000\nProduk mana omzet tertinggi?")])
+    assert "Matcha" in r_tsv.answer and "75%" in r_tsv.answer
+    assert len(eng.calls) == prev_calls

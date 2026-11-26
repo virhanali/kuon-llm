@@ -190,3 +190,106 @@ class LlamaCppEngine:
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
         return result.stdout.strip()
+
+
+class OpenAICompatEngine:
+    """HTTP client for a local llama-server (OpenAI-compatible /v1/chat/completions)."""
+
+    name = "kuon-fusion"
+    supports_chat = True
+
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:8081",
+        *,
+        model: str = "kuon",
+        n_ctx: int = 8192,
+        temperature: float = 0.4,
+        quant_mode: str = "q4_k_m",
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.n_ctx = n_ctx
+        self.temperature = temperature
+        self.quant_mode = quant_mode
+
+    def prompt_fits(self, prompt: str, max_tokens: int = 256) -> bool:
+        return (len(prompt) // 3) + max_tokens <= self.n_ctx
+
+    def _payload(
+        self,
+        messages: list[dict],
+        *,
+        max_tokens: int,
+        temperature: float | None,
+        stream: bool,
+    ) -> bytes:
+        temp = self.temperature if temperature is None else float(temperature)
+        body = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temp,
+            "top_p": 0.9,
+            "stream": stream,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        return json.dumps(body).encode("utf-8")
+
+    def chat(
+        self,
+        messages: list[dict],
+        max_tokens: int = 320,
+        *,
+        temperature: float | None = None,
+    ) -> str:
+        req = urllib.request.Request(
+            f"{self.base_url}/v1/chat/completions",
+            data=self._payload(messages, max_tokens=max_tokens, temperature=temperature, stream=False),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=180) as response:
+            data = json.loads(response.read().decode("utf-8", errors="replace"))
+        choices = data.get("choices") or []
+        if not choices:
+            return ""
+        msg = choices[0].get("message") or {}
+        return str(msg.get("content") or "").strip()
+
+    def chat_stream(
+        self,
+        messages: list[dict],
+        max_tokens: int = 320,
+        *,
+        temperature: float | None = None,
+    ):
+        req = urllib.request.Request(
+            f"{self.base_url}/v1/chat/completions",
+            data=self._payload(messages, max_tokens=max_tokens, temperature=temperature, stream=True),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=180) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data: "):
+                    continue
+                chunk_str = line[6:].strip()
+                if not chunk_str or chunk_str == "[DONE]":
+                    break
+                try:
+                    frame = json.loads(chunk_str)
+                except json.JSONDecodeError:
+                    continue
+                choices = frame.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                piece = delta.get("content")
+                if piece:
+                    yield str(piece)
+
+    def complete(self, prompt: str, max_tokens: int = 320, *, temperature: float | None = None) -> str:
+        return self.chat([{"role": "user", "content": prompt}], max_tokens=max_tokens, temperature=temperature)
+
+    def complete_stream(self, prompt: str, max_tokens: int = 320, *, temperature: float | None = None):
+        return self.chat_stream([{"role": "user", "content": prompt}], max_tokens=max_tokens, temperature=temperature)

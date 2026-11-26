@@ -28,7 +28,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from kuon_agent.agent import AgentConfig, ContextLimitError, KuonAgent
-from kuon_agent.llm import KuonEngine, LlamaCppEngine, MockEngine, OllamaEngine
+from kuon_agent.llm import KuonEngine, LlamaCppEngine, MockEngine, OllamaEngine, OpenAICompatEngine
 from kuon_agent.rag import BM25Index, HybridIndex, OnnxE5Embedder
 
 INDEX_HTML = """<!doctype html>
@@ -534,6 +534,12 @@ def agent_from_env(args) -> KuonAgent:
         if not model:
             raise SystemExit("--engine llamacpp requires --model or KUON_GGUF")
         engine = LlamaCppEngine(model, binary=args.binary)
+    elif engine_name == "llama-server":
+        engine = OpenAICompatEngine(
+            base_url=args.host or os.environ.get("KUON_LLAMA_SERVER", "http://127.0.0.1:8081"),
+            model=args.model or os.environ.get("KUON_LLAMA_MODEL", "kuon"),
+            temperature=float(os.environ.get("KUON_TEMPERATURE", "0.4")),
+        )
     else:
         raise SystemExit(f"unknown engine {engine_name}")
 
@@ -604,7 +610,7 @@ def _load_dotenv() -> None:
 def main() -> None:
     _load_dotenv()
     ap = argparse.ArgumentParser(description="Kuon Agent OpenAI-compatible server")
-    ap.add_argument("--engine", choices=["mock", "kuon", "ollama", "llamacpp"], default=None)
+    ap.add_argument("--engine", choices=["mock", "kuon", "ollama", "llamacpp", "llama-server"], default=None)
     ap.add_argument("--checkpoint", default=None)
     ap.add_argument("--model", default=None, help="Ollama model or GGUF path")
     ap.add_argument("--host", default=None, help="Ollama host (http://localhost:11434)")

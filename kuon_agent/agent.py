@@ -341,6 +341,56 @@ _ID_IDENTITY_HINT_RE = re.compile(
 )
 
 
+_KUON_FUSION_SYSTEM = (
+    "Kamu adalah Kuon, asisten AI self-hosted yang dikembangkan dan dioperasikan oleh Kuon Studio "
+    "(kuonstudio.com, Jakarta).\n"
+    "Panduan utama:\n"
+    "- Jawab dengan cerdas, luwes, jujur, dan langsung ke inti menggunakan bahasa pengguna "
+    "(Indonesia atau Inggris; ikuti gaya santai atau formalnya).\n"
+    "- Kamu bisa membantu berbagai topik: strategi bisnis, operasional, pemasaran, penulisan draf, "
+    "analisis serta ringkasan dokumen, teknologi, dan percakapan sehari-hari.\n"
+    "- Jangan pernah mengarang angka bisnis (omzet, laba, margin, trafik, biaya) yang tidak disebutkan "
+    "pengguna atau dokumen. Jika angka belum ada, tetap berikan sudut pandang atau langkah praktis yang "
+    "berguna, lalu tanyakan data spesifik yang dibutuhkan.\n"
+    "- Jangan pernah menyebut nama vendor atau model pihak ketiga (seperti Google, Gemma, OpenAI, GPT, "
+    "Claude, Llama, Qwen, DeepSeek). Jika ditanya siapa kamu, model apa, ilmu/kemampuanmu, atau siapa "
+    "pengembangmu, jelaskan secara alami bahwa kamu adalah Kuon, asisten AI self-hosted racikan Kuon Studio "
+    "yang dirancang untuk membantu analisis data bisnis, dokumen, serta kebutuhan kerja harian.\n"
+    "- Jika diberikan [Dokumen Lampiran] atau [Bukti Web], jadikan itu rujukan utama. Untuk [Bukti Web], "
+    "sertakan sitasi [1], [2] secara alami."
+)
+
+_KUON_STUDIO_TOPIC_RE = re.compile(
+    r"\b(?:kuon\s*studio|selisik|cadence|pilot\s+2\s+minggu|layanan\s+kuon|harga\s+kuon|kontak\s+kuon|whatsapp\s+kuon)\b",
+    re.I,
+)
+_NO_WEB_SEARCH_RE = re.compile(
+    r"\b(?:kamu|anda|kuon|you|your|yourself|didevelop|di-?develop|dikembangkan|dibuat|ilmu\s+kamu|"
+    r"skill\s+apa|kemampuan|bisnis\s*ku|bisnisku|usaha\s*ku|toko\s+saya|buatkan|buatin|tuliskan|tulis\s+draf|"
+    r"bikin\s+draf|draft\s+a|help\s+me\s+write|sarankan|kasih\s+ide|brainstorm)\b",
+    re.I,
+)
+
+
+def _needs_web_search_fusion(question: str, has_attachments: bool) -> bool:
+    """Decide whether a General QA prompt needs live web lookup on a reasoning-capable engine."""
+    if has_attachments:
+        return False
+    q = question.strip()
+    if not q:
+        return False
+    if _REACTION_RE.fullmatch(q) or is_identity_question(q) or is_capability_question(q):
+        return False
+    if is_smalltalk(q) and len(q.split()) <= 6:
+        return False
+    if _NO_WEB_SEARCH_RE.search(q):
+        return False
+    # Very short 1-2 word non-question messages are conversational
+    if len(q.split()) <= 2 and not q.endswith("?"):
+        return False
+    return True
+
+
 def _clean_source_label(source: str) -> str:
     """Strip internal filesystem directory paths from local RAG source labels."""
     s = (source or "").strip()
@@ -1284,6 +1334,147 @@ class KuonAgent:
 
     # ---------------------------------------------------------------- loop
 
+    def _chat_complete(
+        self,
+        chat_messages: list[dict],
+        *,
+        max_tokens: int,
+        temperature: float | None = None,
+        on_token: Callable[[str], None] | None = None,
+    ) -> tuple[str, bool]:
+        """Run native chat completion on a reasoning-capable engine (e.g., llama-server)."""
+        stream_fn = getattr(self.engine, "chat_stream", None)
+        if on_token is not None and callable(stream_fn):
+            chunks: list[str] = []
+            streamed = False
+            for delta in stream_fn(chat_messages, max_tokens=max_tokens, temperature=temperature):
+                if not delta:
+                    continue
+                chunks.append(delta)
+                on_token(delta)
+                streamed = True
+            return "".join(chunks).strip(), streamed
+
+        chat_fn = getattr(self.engine, "chat")
+        text = chat_fn(chat_messages, max_tokens=max_tokens, temperature=temperature)
+        return text.strip(), False
+
+    def _advise_fusion(
+        self,
+        messages: list[tuple[str, str]],
+        attachments: list[tuple[str, str]],
+        latest_user_text: str,
+        *,
+        on_token: Callable[[str], None] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AgentResult:
+        """Natural multi-turn reasoning path for Business chat on a reasoning-capable engine."""
+        token_budget = min(max_tokens, 640) if max_tokens is not None else 360
+        system_parts = [_KUON_FUSION_SYSTEM]
+        sources: list[dict] = []
+
+        if attachments:
+            att_blocks = []
+            for name, body in attachments[-2:]:
+                att_blocks.append(f"[Dokumen Lampiran: {name}]\n{body[:10000]}")
+                sources.append({"title": name, "url": ""})
+            system_parts.append(
+                "Berikut dokumen yang dilampirkan pengguna. Jawab, ringkas, atau analisis berdasarkan isi dokumen ini:\n\n"
+                + "\n\n".join(att_blocks)
+            )
+        elif self.cfg.use_rag and self.rag is not None and _KUON_STUDIO_TOPIC_RE.search(latest_user_text):
+            kb_bits = []
+            for _score, chunk in self.rag.search(latest_user_text, top_k=2):
+                label = _clean_source_label(chunk.source)
+                kb_bits.append(f"[{label}]\n{chunk.text[:600]}")
+            if kb_bits:
+                system_parts.append("Info resmi Kuon Studio:\n" + "\n\n".join(kb_bits))
+
+        chat_msgs: list[dict] = [{"role": "system", "content": "\n\n".join(system_parts)}]
+        for role, content in messages[-10:]:
+            if role == "user":
+                att, rem = _extract_attachments(content)
+                clean = rem or (f"Tolong analisis file {att[-1][0]}." if att else content)
+                chat_msgs.append({"role": "user", "content": clean})
+            elif role == "assistant":
+                chat_msgs.append({"role": "assistant", "content": content[:1200]})
+
+        answer, streamed = self._chat_complete(
+            chat_msgs,
+            max_tokens=token_budget,
+            temperature=temperature,
+            on_token=on_token,
+        )
+        if on_token is not None and not streamed and answer:
+            on_token(answer)
+        return AgentResult(answer=answer, notes="", sources=sources)
+
+    def _answer_fusion(
+        self,
+        question: str,
+        *,
+        history: list[tuple[str, str]] | None = None,
+        on_token: Callable[[str], None] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AgentResult:
+        """Natural General QA path: thinks freely, calls web search only for external factual queries."""
+        token_budget = min(max_tokens, 640) if max_tokens is not None else 360
+        conv = list(history or [("user", question)])
+        attachments: list[tuple[str, str]] = []
+        prior_users: list[str] = []
+        for role, content in conv:
+            if role == "user":
+                att, rem = _extract_attachments(content)
+                if att:
+                    attachments.extend(att)
+                prior_users.append(rem or content)
+        clean_q = prior_users[-1] if prior_users else question
+
+        if attachments:
+            return self._advise_fusion(
+                conv,
+                attachments,
+                clean_q,
+                on_token=on_token,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+        sources_out: list[dict] = []
+        system_parts = [_KUON_FUSION_SYSTEM]
+        if _needs_web_search_fusion(clean_q, has_attachments=False):
+            search_query = _expand_followup_query(clean_q, prior_users[:-1])
+            gathered = self._gather(search_query)
+            if gathered:
+                ev = self._format_evidence(gathered[:4])
+                system_parts.append(
+                    "Gunakan [Bukti Web] di bawah ini untuk menjawab pertanyaan faktual pengguna secara akurat, "
+                    "ringkas, dan sebutkan nomor rujukan [1], [2] sesuai sumbernya:\n\n"
+                    f"[Bukti Web]\n{ev}"
+                )
+                sources_out = [{"title": s.title, "url": s.url} for s in gathered[:4]]
+        elif self.cfg.use_rag and self.rag is not None and _KUON_STUDIO_TOPIC_RE.search(clean_q):
+            kb_bits = [chunk.text[:600] for _s, chunk in self.rag.search(clean_q, top_k=2)]
+            if kb_bits:
+                system_parts.append("Info resmi Kuon Studio:\n" + "\n\n".join(kb_bits))
+
+        chat_msgs: list[dict] = [{"role": "system", "content": "\n\n".join(system_parts)}]
+        for role, content in conv[-10:]:
+            if role in ("user", "assistant"):
+                chat_msgs.append({"role": role, "content": content[:1200]})
+
+        answer, streamed = self._chat_complete(
+            chat_msgs,
+            max_tokens=token_budget,
+            temperature=temperature,
+            on_token=on_token,
+        )
+        if on_token is not None and not streamed and answer:
+            on_token(answer)
+        return AgentResult(answer=answer, notes="", sources=sources_out)
+
     def _complete(
         self,
         prompt: str,
@@ -1388,47 +1579,48 @@ class KuonAgent:
             and any(_ID_WORDS.search(m) for m in user_msgs[:-1])
         )
 
-        # 0. Capability, identity, greetings, and open business symptom diagnostics
-        if not attachments and is_capability_question(latest_user_text):
-            cap_res = _capability_answer(indonesian)
-            if on_token is not None:
-                on_token(cap_res.answer)
-            return cap_res
-
-        if not attachments and _REACTION_RE.fullmatch(latest_user_text.strip()):
-            en_only = bool(re.fullmatch(r"(?:lol+|lmao|nice+|cool+|good)[!.,?\s]*", latest_user_text.strip(), re.I))
-            msg = (
-                "Got it! Whenever you have a table, document, or question to check, just send it over."
-                if en_only and not indonesian else
-                "Siap! Kalau ada tabel, dokumen, atau pertanyaan lain yang mau dicek, langsung kirim saja."
-            )
-            if on_token is not None:
-                on_token(msg)
-            return AgentResult(answer=msg, notes="", sources=[])
-
-        if (
-            not attachments
-            and (is_identity_question(latest_user_text) or is_smalltalk(latest_user_text))
-            and len(latest_user_text.strip()) <= 140
-            and _extract_embedded_table(latest_user_text) is None
-        ):
-            token_budget = min(max_tokens, 512) if max_tokens is not None else self.cfg.max_answer_tokens
-            text, streamed = self._complete(
-                format_prompt(_normalize_smalltalk_prompt(latest_user_text)),
-                max_tokens=token_budget,
-                temperature=temperature,
-                on_token=on_token,
-            )
-            if on_token is not None and not streamed and text:
-                on_token(text)
-            return AgentResult(answer=text, notes="", sources=[])
-
-        if not attachments:
-            symptom_res = _open_business_symptom_clarify(latest_user_text, indonesian)
-            if symptom_res is not None:
+        # 0. Capability, identity, greetings, and open business symptom diagnostics (compact Kuon 1 path)
+        if not getattr(self.engine, "supports_chat", False):
+            if not attachments and is_capability_question(latest_user_text):
+                cap_res = _capability_answer(indonesian)
                 if on_token is not None:
-                    on_token(symptom_res.answer)
-                return symptom_res
+                    on_token(cap_res.answer)
+                return cap_res
+
+            if not attachments and _REACTION_RE.fullmatch(latest_user_text.strip()):
+                en_only = bool(re.fullmatch(r"(?:lol+|lmao|nice+|cool+|good)[!.,?\s]*", latest_user_text.strip(), re.I))
+                msg = (
+                    "Got it! Whenever you have a table, document, or question to check, just send it over."
+                    if en_only and not indonesian else
+                    "Siap! Kalau ada tabel, dokumen, atau pertanyaan lain yang mau dicek, langsung kirim saja."
+                )
+                if on_token is not None:
+                    on_token(msg)
+                return AgentResult(answer=msg, notes="", sources=[])
+
+            if (
+                not attachments
+                and (is_identity_question(latest_user_text) or is_smalltalk(latest_user_text))
+                and len(latest_user_text.strip()) <= 140
+                and _extract_embedded_table(latest_user_text) is None
+            ):
+                token_budget = min(max_tokens, 512) if max_tokens is not None else self.cfg.max_answer_tokens
+                text, streamed = self._complete(
+                    format_prompt(_normalize_smalltalk_prompt(latest_user_text)),
+                    max_tokens=token_budget,
+                    temperature=temperature,
+                    on_token=on_token,
+                )
+                if on_token is not None and not streamed and text:
+                    on_token(text)
+                return AgentResult(answer=text, notes="", sources=[])
+
+            if not attachments:
+                symptom_res = _open_business_symptom_clarify(latest_user_text, indonesian)
+                if symptom_res is not None:
+                    if on_token is not None:
+                        on_token(symptom_res.answer)
+                    return symptom_res
 
         # 1. Deterministic grounded sales-table comparison, table analytics, & direct KPI calculation
         table_search_msgs = [
@@ -1451,14 +1643,6 @@ class KuonAgent:
                 on_token(table_analytics_answer.answer)
             return table_analytics_answer
 
-        # Explicit summary request on an uploaded attachment
-        if attachments and _SUMMARY_REQUEST_RE.search(latest_user_text):
-            att_name, att_body = attachments[-1]
-            doc_summary = _summarize_attached_document(att_name, att_body, indonesian)
-            if on_token is not None and doc_summary.answer:
-                on_token(doc_summary.answer)
-            return doc_summary
-
         embedded_tbl = _extract_embedded_table(latest_raw_user_text)
         if not embedded_tbl:
             kpi_answer = _answer_direct_kpi(table_search_msgs, indonesian)
@@ -1466,6 +1650,25 @@ class KuonAgent:
                 if on_token is not None and kpi_answer.answer:
                     on_token(kpi_answer.answer)
                 return kpi_answer
+
+        # Fusion reasoning engine handles open conversation, strategy, and document analysis natively
+        if getattr(self.engine, "supports_chat", False):
+            return self._advise_fusion(
+                messages,
+                attachments,
+                latest_user_text,
+                on_token=on_token,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+        # Explicit summary request on an uploaded attachment (compact Kuon 1 path)
+        if attachments and _SUMMARY_REQUEST_RE.search(latest_user_text):
+            att_name, att_body = attachments[-1]
+            doc_summary = _summarize_attached_document(att_name, att_body, indonesian)
+            if on_token is not None and doc_summary.answer:
+                on_token(doc_summary.answer)
+            return doc_summary
 
         if embedded_tbl:
             try:
@@ -1604,6 +1807,14 @@ class KuonAgent:
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> AgentResult:
+        if getattr(self.engine, "supports_chat", False):
+            return self._answer_fusion(
+                question,
+                history=history,
+                on_token=on_token,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
         token_budget = min(max_tokens, 512) if max_tokens is not None else self.cfg.max_answer_tokens
         prior_users = [c for r, c in (history or [])[:-1] if r == "user" and c.strip()]
         # If user attached a file in General QA mode, answer from the attachment instead of web search
