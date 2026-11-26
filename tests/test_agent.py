@@ -219,7 +219,7 @@ def test_capability_open_symptom_and_multiturn_table_to_kpi_transition():
 
 def test_fusion_chat_engine_reasons_freely_and_preserves_exact_kpi():
     class FakeChatEngine:
-        name = "kuon-fusion"
+        name = "kuon-1"
         supports_chat = True
 
         def __init__(self):

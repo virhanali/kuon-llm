@@ -195,14 +195,14 @@ class LlamaCppEngine:
 class OpenAICompatEngine:
     """HTTP client for a local llama-server (OpenAI-compatible /v1/chat/completions)."""
 
-    name = "kuon-fusion"
+    name = "kuon-1"
     supports_chat = True
 
     def __init__(
         self,
         base_url: str = "http://127.0.0.1:8081",
         *,
-        model: str = "kuon",
+        model: str = "kuon-1",
         n_ctx: int = 8192,
         temperature: float = 0.4,
         quant_mode: str = "q4_k_m",
