@@ -88,6 +88,7 @@ def save_checkpoint(path: str | Path, model, model_cfg, train_cfg, step: int,
 
 def train(name: str, model_cfg, train_cfg, *, data_dir: str | None = None,
           steps: int | None = None, stop_step: int | None = None,
+          max_seconds: float | None = None,
           device: str | None = None,
           resume: str | None = None, upcycle_from: str | None = None,
           init_from: str | None = None,
@@ -149,6 +150,7 @@ def train(name: str, model_cfg, train_cfg, *, data_dir: str | None = None,
         log = JsonlLogger(train_cfg.log_file) if is_master else None
 
         raw_model = Transformer(model_cfg).to(device)
+        raw_model.grad_checkpoint = bool(train_cfg.grad_checkpoint)
         opt = torch.optim.AdamW(
             decay_param_groups(raw_model, train_cfg.weight_decay, train_cfg.lr, train_cfg.betas),
             lr=train_cfg.lr, betas=tuple(train_cfg.betas), fused=is_cuda)
@@ -281,7 +283,17 @@ def train(name: str, model_cfg, train_cfg, *, data_dir: str | None = None,
             if first_loss is None:
                 first_loss = step_loss
 
-            if (step + 1 - schedule_start) % train_cfg.eval_interval == 0 or step + 1 == end_step:
+            time_up = False
+            if max_seconds is not None and max_seconds > 0 and step + 1 < end_step:
+                flag = torch.tensor(
+                    1 if (is_master and (time.time() - t_start) >= max_seconds) else 0,
+                    device=device, dtype=torch.int32,
+                )
+                if ddp:
+                    dist.broadcast(flag, src=0)
+                time_up = bool(flag.item())
+
+            if (step + 1 - schedule_start) % train_cfg.eval_interval == 0 or step + 1 == end_step or time_up:
                 if is_master:
                     dt = time.time() - t_iter
                     t_iter = time.time()
@@ -309,8 +321,13 @@ def train(name: str, model_cfg, train_cfg, *, data_dir: str | None = None,
                         best_val = val
                         save_checkpoint(ckpt_dir / f"{name}-best.pt", raw_model, model_cfg,
                                         train_cfg, step + 1, opt, val)
+                    if time_up:
+                        print(f"[kuon] reached max_seconds={max_seconds:.0f}s at step {step+1}/{steps}; "
+                              f"checkpoint saved cleanly.", flush=True)
                 if ddp:
                     dist.barrier()
+                if time_up:
+                    break
 
         return {
             "name": name,

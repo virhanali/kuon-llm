@@ -25,6 +25,8 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=None, help="override total steps (defines cosine LR horizon)")
     ap.add_argument("--stop-step", type=int, default=None,
                     help="optional early stop step (saves checkpoint cleanly while keeping cosine schedule over --steps)")
+    ap.add_argument("--max-seconds", type=float, default=None,
+                    help="optional wall-clock budget in seconds (saves checkpoint cleanly on time-box expiry)")
     ap.add_argument("--batch-size", type=int, default=None, help="override microbatch size per GPU")
     ap.add_argument("--grad-accum", type=int, default=None, help="override gradient accumulation steps")
     ap.add_argument("--eval-interval", type=int, default=None, help="override evaluation interval")
@@ -42,6 +44,8 @@ def main() -> None:
     ap.add_argument("--schedule-start", type=int, default=0,
                     help="step offset where the cosine LR schedule starts")
     ap.add_argument("--compile", action="store_true", help="torch.compile (cuda)")
+    ap.add_argument("--grad-checkpoint", action="store_true", help="enable activation checkpointing to save VRAM")
+    ap.add_argument("--no-grad-checkpoint", action="store_true", help="disable activation checkpointing for speed on 24GB+ GPUs")
     ap.add_argument("--quiet", action="store_true", help="no progress samples")
     args = ap.parse_args()
 
@@ -63,11 +67,17 @@ def main() -> None:
         overrides["checkpoint_dir"] = args.checkpoint_dir
     if args.log_file is not None:
         overrides["log_file"] = args.log_file
+    if args.grad_checkpoint and args.no_grad_checkpoint:
+        ap.error("cannot set both --grad-checkpoint and --no-grad-checkpoint")
+    if args.grad_checkpoint:
+        overrides["grad_checkpoint"] = True
+    elif args.no_grad_checkpoint:
+        overrides["grad_checkpoint"] = False
     if overrides:
         tcfg = replace(tcfg, **overrides)
 
     train(name, mcfg, tcfg, data_dir=args.data_dir, steps=args.steps,
-          stop_step=args.stop_step,
+          stop_step=args.stop_step, max_seconds=args.max_seconds,
           device=args.device, resume=args.resume, init_from=args.init_from,
           upcycle_from=args.upcycle_from, schedule_start=args.schedule_start,
           compile_=args.compile or tcfg.compile, quiet=args.quiet)

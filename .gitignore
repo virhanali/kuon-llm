@@ -12,4 +12,6 @@ logs/
 *.gguf
 *.pt
 *.zip
+.env
+.env.*
 .DS_Store

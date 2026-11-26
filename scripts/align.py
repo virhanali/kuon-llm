@@ -35,6 +35,7 @@ def main() -> None:
     ap.add_argument("--eval-interval", type=int, default=50)
     ap.add_argument("--device", default=None)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--grad-checkpoint", action="store_true", help="enable activation checkpointing to save VRAM")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
@@ -44,7 +45,8 @@ def main() -> None:
         lr=args.lr, min_lr=args.min_lr, warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay, beta=args.beta, sft_weight=args.sft_weight,
         eval_interval=args.eval_interval, device=args.device, seed=args.seed,
-        tokenizer_path=args.tokenizer, business=args.business, quiet=args.quiet,
+        tokenizer_path=args.tokenizer, business=args.business,
+        grad_checkpoint=args.grad_checkpoint, quiet=args.quiet,
     )
 
 

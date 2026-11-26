@@ -34,6 +34,7 @@ def main() -> None:
     ap.add_argument("--device", default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--sample-prompt", default="Tell me a story.")
+    ap.add_argument("--grad-checkpoint", action="store_true", help="enable activation checkpointing to save VRAM")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
@@ -43,7 +44,8 @@ def main() -> None:
         weight_decay=args.weight_decay, eval_interval=args.eval_interval,
         patience=args.patience, device=args.device,
         seed=args.seed, sample_prompt=args.sample_prompt, quiet=args.quiet,
-        tokenizer_path=args.tokenizer, business=args.business)
+        tokenizer_path=args.tokenizer, business=args.business,
+        grad_checkpoint=args.grad_checkpoint)
 
 
 if __name__ == "__main__":

@@ -9,15 +9,27 @@ Kuon is a small, open-source language model and evidence-grounded business agent
 | Config | Parameters | Stored / Effective Depth | Context | Vocab | Notes |
 |---|---:|---|---:|---:|---|
 | [`configs/kuon-13m.json`](configs/kuon-13m.json) | 12.59M | 6 / 6 layers | 512 | 8,192 | Lightweight demo ([public demo weights](https://github.com/virhanali/kuon-llm/releases/tag/v0.3-sft)) |
-| [`configs/kuon-1-dense.json`](configs/kuon-1-dense.json) | 119.56M | 16 / 16 layers | 1,024 | 24,576 | Bilingual EN/ID dense base |
-| [`configs/kuon-1-loop.json`](configs/kuon-1-loop.json) | 119.61M | 16 / 24 layers | 1,024 | 24,576 | Bilingual EN/ID Gated-Loop (`loop_gate_rank=32`) |
+| [`configs/kuon-1-loop.json`](configs/kuon-1-loop.json) | 119.61M | 16 / 24 layers | 1,024 | 24,576 | Earlier 120M Gated-Loop prototype |
+| [`configs/kuon-2-dense.json`](configs/kuon-2-dense.json) | 295.75M | 24 / 24 layers | 1,024 | 24,576 | Kuon 1 Stage 1 dense pretraining base (`2.40B` tokens) |
+| [`configs/kuon-2-loop.json`](configs/kuon-2-loop.json) | 295.81M | 24 / 32 layers | 1,024 | 24,576 | **Kuon 1** release architecture (`3.40B` tokens + Stage 3 v4.2, `307 MB` INT8) |
 
-### Architecture highlights (`kuon-1-loop`)
+### Architecture highlights (Kuon 1 — `configs/kuon-2-loop.json`)
 
-- **Recurrent depth (Gated-Loop):** 16 stored transformer blocks where the 8 middle blocks (`4..11`) execute twice via a learned low-rank residual gate (`loop_gate_rank=32`), giving 24 effective layers with negligible parameter overhead.
+- **Recurrent depth (Gated-Loop):** 24 stored transformer blocks where the 8 middle blocks (`8..15`) execute twice via a learned low-rank residual gate (`loop_gate_rank=32`), giving 32 effective layers with negligible parameter overhead.
 - **Modern transformer core:** Pre-norm RMSNorm, RoPE positional embeddings, Grouped-Query Attention (12 query heads / 4 KV heads), SwiGLU feed-forward blocks, tied input/output embeddings, and per-pass KV caching for generation.
 - **Balanced bilingual tokenizer:** 24,576-token byte-level BPE (`tokenizers/kuon1-bilingual-24k.json`) trained on balanced English–Indonesian text and business/numeric formats.
-- **Compact footprint:** ~456 MiB in FP32 weights; a full 1,024-token FP32 KV cache at batch size 1 adds ~48 MiB.
+- **CPU-friendly INT8 weights:** Portable `307 MB` INT8 release checkpoint (`kuon/quant.py`, `3.99x` smaller than FP32) running at ~`13.9 tok/s` on 4 CPU threads in lossless `int8_weights` mode with `100%` FP32 benchmark parity.
+
+### Kuon 1 release evaluation (Stage 3 v4.2, FP32 & INT8 identical)
+
+| Metric | Target | Kuon 1 INT8 (`307 MB`) |
+|---|---:|---:|
+| Grounded calibration accuracy (`16` unseen EN/ID cases) | High | `15/16` (`93.8%`: EN `8/8`, ID `7/8`) |
+| Unanswerable restraint | `>= 90%` | `100.0%` (`8/8` EN & ID) |
+| Answerable recall | `>= 75%` | `87.5%` (`7/8`: EN `100%`, ID `75%`) |
+| Hallucination rate | `< 10%` | `6.2%` (`1/16`, EN `0.0%`) |
+| Pillar 2 business deliverables rubric | `>= 90%` | `94.4%` (`34/36`) |
+| Confirmed causal action selection | Stable | `59.7%` (`43/72`) |
 
 ## Quickstart
 
@@ -75,14 +87,15 @@ curl http://127.0.0.1:8000/v1/chat/completions \
     }'
 ```
 
-In business mode (`x_kuon_mode: "business"`), the agent combines the model with deterministic verification primitives in `kuon_agent/tools.py`:
+In business mode (`x_kuon_mode: "business"`), the agent combines the model with deterministic verification primitives in `kuon_agent/tools.py` and `kuon_agent/agent.py`:
 
 - **Safe arithmetic & KPI formulas:** AST-verified calculator (`safe_calc`) and exact formulas (`business_kpi`) for gross/net margin, percentage change, conversion rate, AOV, break-even units, ROI, and EOQ.
-- **Table & multi-turn tracking:** Parses Markdown/CSV tables (`summarize_table`), handles multi-turn missing values or corrections, and tracks client facts in a per-request `FactLedger`.
-- **Optional local RAG:** Pass `--rag path/to/docs` to index local `.txt` / `.md` files with BM25.
-- **Response provenance:** Responses include `x_notes` (formula/tool traces) and `x_sources` (cited evidence), ignored by standard OpenAI clients.
+- **Table & multi-turn analytics:** Parses Markdown, CSV, and Excel/Google Sheets TSV tables (`summarize_table`), computes exact period deltas, highest/lowest, totals, averages, and percentage shares, handles multi-turn missing values or corrections, and checks currency consistency.
+- **Hybrid RAG (MIT):** Pass `--rag path/to/docs --semantic-rag` (or `KUON_SEMANTIC_RAG=1`) to combine BM25 with `intfloat/multilingual-e5-small` ONNX (`118 MB`, ~`6.3 ms` CPU query latency) across `.txt`, `.md`, `.csv`, and `.tsv` files, with automatic multi-turn follow-up query expansion.
+- **Live web grounding (General QA only):** Set `EXA_API_KEY` in `.env` or environment secrets to enable Exa AI live highlights with publication dates, trusted-domain priority, multi-domain diversity, and post-generation number/currency verification. Business mode stays isolated from the public web.
+- **Production HTTP server:** Supports live SSE token streaming (`stream: true`), serialized inference queue telemetry in `/health`, optional Bearer authentication via `KUON_API_KEY`, 1 MB body cap, and `x_notes` / `x_sources` provenance fields.
 
-The server binds to `127.0.0.1:8000` by default with no built-in authentication. Do not expose it directly to the public internet without a reverse proxy, authentication, and rate limiting. See [`deploy/README.md`](deploy/README.md) for deployment examples.
+See [`deploy/instabox-setup.sh`](deploy/instabox-setup.sh) and [`deploy/README.md`](deploy/README.md) for CPU-only VPS / InstaBox deployment (`4 vCPU / 8 GiB RAM`).
 
 ## Training pipeline
 

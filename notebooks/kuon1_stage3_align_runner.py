@@ -37,10 +37,10 @@ def locate_loop_ckpt(explicit: str | None = None) -> Path:
     for base in (Path("/kaggle/input"), Path("/content"), ROOT / "checkpoints"):
         if not base.exists():
             continue
-        for name in ("kuon-1-loop-best.pt", "kuon-1-loop-last.pt"):
+        for name in ("kuon-2-loop-best.pt", "kuon-2-loop-last.pt", "kuon-1-loop-best.pt", "kuon-1-loop-last.pt"):
             for match in base.rglob(name):
                 return match
-    raise FileNotFoundError("Could not locate kuon-1-loop-best.pt (pass --base or attach Stage 2 notebook output)")
+    raise FileNotFoundError("Could not locate kuon-2-loop-best.pt or kuon-1-loop-best.pt (pass --base)")
 
 
 def run_eval_suite(
@@ -145,11 +145,15 @@ def main() -> None:
     ap.add_argument("--align-lr", type=float, default=1e-5)
     ap.add_argument("--beta", type=float, default=2.0)
     ap.add_argument("--sft-weight", type=float, default=0.1)
+    ap.add_argument("--grad-checkpoint", action="store_true", help="enable activation checkpointing for 300M+ models")
+    ap.add_argument("--model-tag", default="kuon-0.1", help="prefix for saved Stage 3 checkpoints")
+    ap.add_argument("--sft-data", default=None, help="optional pre-built directory containing sft_train.jsonl and sft_val.jsonl")
+    ap.add_argument("--prefs-data", default=None, help="optional pre-built directory containing prefs_train.jsonl and prefs_val.jsonl")
     args = ap.parse_args()
 
     out_root = Path(args.out)
-    sft_data_dir = out_root / "sft-data-v2"
-    prefs_data_dir = out_root / "prefs-data"
+    sft_data_dir = Path(args.sft_data) if args.sft_data else (out_root / "sft-data-v2")
+    prefs_data_dir = Path(args.prefs_data) if args.prefs_data else (out_root / "prefs-data")
     ckpt_dir = out_root / "checkpoints"
     eval_dir = out_root / "eval"
     for d in (sft_data_dir, prefs_data_dir, ckpt_dir, eval_dir):
@@ -171,12 +175,16 @@ def main() -> None:
     run_eval_suite(base_ckpt, tok_path, eval_dir, "0_stage2_base", env, full=False)
 
     # 1. Stage 3A — Clean Diverse Bilingual SFT + 15% Experience Rehearsal
-    print("\n[stage3-align] Phase 3A — Building clean diverse bilingual SFT + rehearsal corpus...", flush=True)
-    subprocess.run(
-        [sys.executable, "-u", "scripts/prepare_kuon1_sft.py", "--tokenizer", str(tok_path), "--out", str(sft_data_dir)],
-        cwd=str(ROOT), env=env, check=True,
-    )
-    sft_ckpt = ckpt_dir / "kuon-0.1-sft-v2.pt"
+    if (sft_data_dir / "sft_train.jsonl").is_file() and (sft_data_dir / "sft_val.jsonl").is_file():
+        print(f"\n[stage3-align] Phase 3A — Using pre-built SFT corpus in {sft_data_dir}", flush=True)
+    else:
+        print("\n[stage3-align] Phase 3A — Building clean diverse bilingual SFT + rehearsal corpus...", flush=True)
+        subprocess.run(
+            [sys.executable, "-u", "scripts/prepare_kuon1_sft.py", "--tokenizer", str(tok_path), "--out", str(sft_data_dir)],
+            cwd=str(ROOT), env=env, check=True,
+        )
+    gc_args = ["--grad-checkpoint"] if args.grad_checkpoint else []
+    sft_ckpt = ckpt_dir / f"{args.model_tag}-sft-v2.pt"
     print(f"\n[stage3-align] Phase 3A — Running SFT ({args.sft_steps} steps @ bs=4x4, lr={args.sft_lr})...", flush=True)
     subprocess.run(
         [
@@ -188,18 +196,21 @@ def main() -> None:
             "--warmup-steps", "40", "--weight-decay", "0.01",
             "--eval-interval", "65", "--patience", "4",
             "--device", "cuda", "--sample-prompt", "Penjualan toko minggu ini turun 15%.",
-        ],
+        ] + gc_args,
         cwd=str(ROOT), env=env, check=True,
     )
     run_eval_suite(sft_ckpt, tok_path, eval_dir, "1_after_sft_v2", env, full=False)
 
     # 2. Stage 3B — Context-APO-zero / ORPO Preference Alignment
-    print("\n[stage3-align] Phase 3B — Building counterfactual + calibration preference pairs...", flush=True)
-    subprocess.run(
-        [sys.executable, "-u", "scripts/prepare_kuon1_prefs.py", "--tokenizer", str(tok_path), "--out", str(prefs_data_dir)],
-        cwd=str(ROOT), env=env, check=True,
-    )
-    aligned_ckpt = ckpt_dir / f"kuon-0.1-{args.align_method}.pt"
+    if (prefs_data_dir / "prefs_train.jsonl").is_file() and (prefs_data_dir / "prefs_val.jsonl").is_file():
+        print(f"\n[stage3-align] Phase 3B — Using pre-built preference pairs in {prefs_data_dir}", flush=True)
+    else:
+        print("\n[stage3-align] Phase 3B — Building counterfactual + calibration preference pairs...", flush=True)
+        subprocess.run(
+            [sys.executable, "-u", "scripts/prepare_kuon1_prefs.py", "--tokenizer", str(tok_path), "--out", str(prefs_data_dir)],
+            cwd=str(ROOT), env=env, check=True,
+        )
+    aligned_ckpt = ckpt_dir / f"{args.model_tag}-{args.align_method}.pt"
     print(f"\n[stage3-align] Phase 3B — Running {args.align_method} ({args.align_steps} steps @ bs=4x4, lr={args.align_lr})...", flush=True)
     subprocess.run(
         [
@@ -212,20 +223,49 @@ def main() -> None:
             "--warmup-steps", "25", "--weight-decay", "0.01",
             "--beta", str(args.beta), "--sft-weight", str(args.sft_weight),
             "--eval-interval", "50", "--device", "cuda",
-        ],
+        ] + gc_args,
         cwd=str(ROOT), env=env, check=True,
     )
 
-    # 3. Full 5-Suite Holdout Evaluation on final aligned checkpoint
+    # 3. Full 6-Suite Holdout Evaluation on final aligned checkpoint
     run_eval_suite(aligned_ckpt, tok_path, eval_dir, f"2_after_{args.align_method}", env, full=True)
 
-    # 4. Lossless inference export (weights unchanged FP32, optimizer stripped)
-    inf_ckpt = ckpt_dir / "kuon-0.1-inference.pt"
+    # 4. Lossless inference export (weights unchanged FP32, optimizer stripped) + portable INT8 CPU export + parity check
+    inf_ckpt = ckpt_dir / f"{args.model_tag}-inference.pt"
     if not inf_ckpt.exists():
         subprocess.run(
             [sys.executable, "-u", "scripts/export_inference.py", "--checkpoint", str(aligned_ckpt), "--out", str(inf_ckpt)],
             cwd=str(ROOT), env=env, check=False,
         )
+    int8_ckpt = ckpt_dir / f"{args.model_tag}-int8.pt"
+    if inf_ckpt.exists() and not int8_ckpt.exists():
+        subprocess.run(
+            [
+                sys.executable, "-u", "scripts/quantize_cpu.py",
+                "--checkpoint", str(inf_ckpt), "--out", str(int8_ckpt),
+                "--threads", "4", "--bench",
+            ],
+            cwd=str(ROOT), env=env, check=False,
+        )
+    if int8_ckpt.exists():
+        parity_dir = eval_dir / "3_int8_parity"
+        parity_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n========== INT8 PARITY CHECK ({int8_ckpt.name}) ==========", flush=True)
+        subprocess.run(
+            [
+                sys.executable, "-u", "scripts/eval_business_agent.py",
+                "--checkpoint", str(int8_ckpt), "--tokenizer", str(tok_path),
+                "--device", "cpu", "--out", str(parity_dir / "business_agent_eval.json"),
+            ],
+            cwd=str(ROOT), env=env, check=False,
+        )
+        ca_int8 = subprocess.run(
+            [sys.executable, "-u", "scripts/eval_confirmed_actions.py", "--checkpoint", str(int8_ckpt)],
+            cwd=str(ROOT), env=env, capture_output=True, text=True, check=False,
+        )
+        (parity_dir / "confirmed_actions.jsonl").write_text(ca_int8.stdout, encoding="utf-8")
+        if ca_int8.stdout.strip():
+            print("[3_int8_parity confirmed_actions]", ca_int8.stdout.strip().splitlines()[-1], flush=True)
 
     print(f"\n[stage3-align] ALL PHASES COMPLETE! Outputs saved under {out_root}", flush=True)
 

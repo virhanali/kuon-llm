@@ -371,7 +371,7 @@ def period_aliases(label: str, header: str = "") -> set[str]:
 
 
 def parse_table(text: str) -> tuple[list[str], list[list[str]]]:
-    """Return the headers and raw cells from a CSV or Markdown table."""
+    """Return the headers and raw cells from a CSV, TSV (Excel/Sheets), or Markdown table."""
     lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
     if len(lines) < 2:
         raise ValueError("table must contain a header row and at least one data row")
@@ -383,6 +383,11 @@ def parse_table(text: str) -> tuple[list[str], list[list[str]]]:
             if all(re.fullmatch(r":?-{2,}:?", c or "") for c in cells):
                 continue
             rows.append(cells)
+    elif "\t" in lines[0] and sum("\t" in ln for ln in lines[:4]) >= 2:
+        for ln in lines:
+            cells = [c.strip() for c in ln.split("\t")]
+            if any(cells):
+                rows.append(cells)
     else:
         reader = csv.reader(io.StringIO("\n".join(lines)))
         rows = [[c.strip() for c in r] for r in reader if any(c.strip() for c in r)]
@@ -489,8 +494,15 @@ def verify_grounded_answer(
         )
         return False, fallback
 
-    # Check 2: ungrounded numeric claims not present in question + evidence
-    allowed = extract_grounded_numbers(question + "\n" + evidence)
+    # Check 2 & 3: ungrounded numeric claims and currency mismatches vs question + evidence
+    source_blob = question + "\n" + evidence
+    allowed = extract_grounded_numbers(source_blob)
+    allowed_currencies: set[str] = set()
+    for src_match in _INLINE_AMOUNT_RE.finditer(source_blob):
+        _, src_unit = parse_amount(src_match.group(0))
+        if src_unit and src_unit != "%":
+            allowed_currencies.add(src_unit)
+
     if allowed:
         for match in _INLINE_AMOUNT_RE.finditer(clean_ans):
             start = match.start()
@@ -499,9 +511,17 @@ def verify_grounded_answer(
                 continue
             if start >= 1 and clean_ans[start] == "-" and clean_ans[start - 1].isalpha():
                 continue
-            val, _ = parse_amount(match.group(0))
+            val, ans_unit = parse_amount(match.group(0))
             if val is None:
                 continue
+            if allowed_currencies and ans_unit and ans_unit != "%" and ans_unit not in allowed_currencies:
+                cur_list = ", ".join(sorted(allowed_currencies))
+                fallback = (
+                    f"Satuan mata uang jawaban tidak sesuai dengan bukti sumber ({cur_list}). Bisa konfirmasi angka dan mata uang pada dokumen sumber?"
+                    if indonesian else
+                    f"The answer's currency did not match the source evidence ({cur_list}). Please confirm the exact currency from the source document."
+                )
+                return False, fallback
             if not any(abs(val - a) <= max(1e-6, 1e-4 * abs(a)) or abs(abs(val) - abs(a)) <= max(1e-6, 1e-4 * abs(a))
                        for a in allowed):
                 fallback = (

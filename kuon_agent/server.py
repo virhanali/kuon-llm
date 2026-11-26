@@ -18,15 +18,18 @@ Run:
 from __future__ import annotations
 
 import argparse
+import hmac
+import inspect
 import json
 import os
+import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from kuon_agent.agent import AgentConfig, ContextLimitError, KuonAgent
 from kuon_agent.llm import KuonEngine, LlamaCppEngine, MockEngine, OllamaEngine
-from kuon_agent.rag import BM25Index
+from kuon_agent.rag import BM25Index, HybridIndex, OnnxE5Embedder
 
 INDEX_HTML = """<!doctype html>
 <html lang="en">
@@ -139,23 +142,58 @@ async function ask() {
   history.push({role: 'user', content: question});
   const bubble = addMessage('assistant', '…');
   try {
-    const req = {model: 'kuon-agent', messages: history.slice()};
+    const req = {model: 'kuon-agent', messages: history.slice(), stream: true};
     if (modeSel.value === 'business') req.x_kuon_mode = 'business';
     const response = await fetch('/v1/chat/completions', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(req)
     });
-    const data = await response.json();
     if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
       history.pop();
       bubble.textContent = data.error?.message || 'Could not answer. Please try again.';
       return;
     }
-    const content = data.choices[0].message.content;
-    history.push({role: 'assistant', content});
-    bubble.textContent = content;
-    addProvenance(bubble, data.x_notes || '', data.x_sources || []);
+    const ctype = response.headers.get('Content-Type') || '';
+    if (ctype.includes('text/event-stream') && response.body) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '', content = '', notes = '', sources = [];
+      bubble.textContent = '';
+      while (true) {
+        const {done, value} = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, {stream: true});
+        let nl;
+        while ((nl = buf.indexOf('\n\n')) !== -1) {
+          const block = buf.slice(0, nl);
+          buf = buf.slice(nl + 2);
+          for (const line of block.split('\n')) {
+            if (!line.startsWith('data: ')) continue;
+            const raw = line.slice(6).trim();
+            if (!raw || raw === '[DONE]') continue;
+            const frame = JSON.parse(raw);
+            const delta = frame.choices?.[0]?.delta?.content;
+            if (delta) {
+              content += delta;
+              bubble.textContent = content;
+              window.scrollTo(0, document.body.scrollHeight);
+            }
+            if (frame.x_notes) notes = frame.x_notes;
+            if (frame.x_sources) sources = frame.x_sources;
+          }
+        }
+      }
+      history.push({role: 'assistant', content});
+      addProvenance(bubble, notes, sources);
+    } else {
+      const data = await response.json();
+      const content = data.choices[0].message.content;
+      history.push({role: 'assistant', content});
+      bubble.textContent = content;
+      addProvenance(bubble, data.x_notes || '', data.x_sources || []);
+    }
   } catch (error) {
     history.pop();
     bubble.textContent = 'Error: ' + error;
@@ -196,10 +234,26 @@ def _content_of(message: dict) -> str:
     return str(content)
 
 
+def _call_compat(fn, *args, **kwargs):
+    """Forward optional kwargs only if `fn` accepts them (keeps test stubs compatible)."""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn(*args)
+    params = sig.parameters
+    accepts_var = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    filtered = kwargs if accepts_var else {k: v for k, v in kwargs.items() if k in params}
+    return fn(*args, **filtered)
+
+
 def build_handler(agent, model_name: str = "kuon-agent",
-                  agents: dict | None = None):
+                  agents: dict | None = None,
+                  *, api_key: str | None = None):
     """agents maps model ids -> KuonAgent; model_name is the default id."""
     registry = dict(agents) if agents else {model_name: agent}
+    inference_lock = threading.Lock()
+    state_lock = threading.Lock()
+    runtime_state = {"active": 0, "queued": 0}
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -213,6 +267,15 @@ def build_handler(agent, model_name: str = "kuon-agent",
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+        def _authorized(self) -> bool:
+            if not api_key:
+                return True
+            hdr = self.headers.get("Authorization", "").strip()
+            if not hdr.lower().startswith("bearer "):
+                return False
+            token = hdr[7:].strip()
+            return hmac.compare_digest(token, api_key)
 
         def _json(self, status: int, payload: dict):
             body = json.dumps(payload).encode()
@@ -232,34 +295,75 @@ def build_handler(agent, model_name: str = "kuon-agent",
             self.end_headers()
 
         def do_GET(self):
-            if self.path in ("/", "/index.html"):
+            path = self.path.split("?", 1)[0]
+            if path in ("/", "/index.html"):
                 body = INDEX_HTML.encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
-            elif self.path == "/v1/models":
+            elif path == "/v1/models":
+                if not self._authorized():
+                    self._json(401, {"error": {"message": "unauthorized", "code": "invalid_api_key"}})
+                    return
                 self._json(200, {
                     "object": "list",
                     "data": [{"id": name, "object": "model", "owned_by": "kuon"}
                              for name in registry],
                 })
-            elif self.path == "/health":
-                self._json(200, {"status": "ok", "model": model_name})
+            elif path == "/health":
+                with state_lock:
+                    active = runtime_state["active"]
+                    queued = runtime_state["queued"]
+                eng = getattr(agent, "engine", None)
+                self._json(200, {
+                    "status": "ok",
+                    "model": model_name,
+                    "engine": getattr(eng, "name", "unknown"),
+                    "quant": getattr(eng, "quant_mode", None),
+                    "busy": active > 0,
+                    "queue_depth": queued,
+                })
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
         def do_POST(self):
-            if self.path != "/v1/chat/completions":
+            path = self.path.split("?", 1)[0]
+            if path != "/v1/chat/completions":
                 self._json(404, {"error": {"message": "not found"}})
                 return
+            if not self._authorized():
+                self._json(401, {"error": {"message": "unauthorized", "code": "invalid_api_key"}})
+                return
+            sse_started = False
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-                payload = json.loads(self.rfile.read(length) or b"{}")
+                raw_len = self.headers.get("Content-Length", "0")
+                try:
+                    length = int(raw_len)
+                except ValueError:
+                    self._json(400, {"error": {"message": "invalid Content-Length header"}})
+                    return
+                if length < 0:
+                    self._json(400, {"error": {"message": "invalid Content-Length header"}})
+                    return
+                if length > 1_048_576:
+                    self._json(413, {"error": {"message": "request body exceeds 1 MB limit"}})
+                    return
+                try:
+                    payload = json.loads(self.rfile.read(length) or b"{}")
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    self._json(400, {"error": {"message": "invalid JSON body"}})
+                    return
+                if not isinstance(payload, dict):
+                    self._json(400, {"error": {"message": "request body must be a JSON object"}})
+                    return
                 messages = payload.get("messages", [])
+                if not isinstance(messages, list):
+                    self._json(400, {"error": {"message": "messages must be a list"}})
+                    return
                 user_index = next((i for i in range(len(messages) - 1, -1, -1)
-                                   if messages[i].get("role") == "user"), -1)
+                                   if isinstance(messages[i], dict) and messages[i].get("role") == "user"), -1)
                 question = _content_of(messages[user_index]).strip() if user_index >= 0 else ""
                 if not question:
                     self._json(400, {"error": {"message": "no user message"}})
@@ -267,31 +371,115 @@ def build_handler(agent, model_name: str = "kuon-agent",
 
                 requested = payload.get("model") or model_name
                 chosen = registry.get(requested, agent)
-                if payload.get("x_kuon_mode") == "business":
-                    history = [(m["role"], _content_of(m).strip())
-                               for m in messages[:user_index + 1]
-                               if m.get("role") in ("user", "assistant")]
-                    try:
-                        result = chosen.advise(history)
-                    except ContextLimitError:
-                        self._json(400, {"error": {
-                            "code": "context_length_exceeded",
-                            "message": "The latest message exceeds the token budget. Shorten it and try again.",
-                        }})
+                wants_stream = bool(payload.get("stream"))
+                try:
+                    req_temp = payload.get("temperature")
+                    temperature = max(0.0, min(1.5, float(req_temp))) if req_temp is not None else None
+                    req_max = payload.get("max_tokens")
+                    max_tokens = max(1, min(512, int(req_max))) if req_max is not None else None
+                except (TypeError, ValueError):
+                    self._json(400, {"error": {"message": "invalid temperature or max_tokens"}})
+                    return
+
+                completion_id = "chatcmpl-" + uuid.uuid4().hex
+                created = int(time.time())
+                emitted_any = False
+
+                def start_sse():
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("X-Accel-Buffering", "no")
+                    self.send_header("Connection", "close")
+                    self._cors()
+                    self.end_headers()
+                    send_chunk({"role": "assistant"})
+
+                def send_chunk(delta: dict, finish=None, extra: dict | None = None):
+                    frame = {
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": requested or model_name,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                    }
+                    if extra:
+                        frame.update(extra)
+                    self.wfile.write(b"data: " + json.dumps(frame).encode() + b"\n\n")
+                    self.wfile.flush()
+
+                def on_token(piece: str):
+                    nonlocal sse_started, emitted_any
+                    if not piece:
                         return
-                    except NotImplementedError:
-                        self._json(501, {"error": {
-                            "message": "Business chat is unavailable on the selected engine.",
-                        }})
-                        return
-                else:
-                    result = chosen.answer(question)
-                if payload.get("stream"):
-                    self._stream(result, question, requested)
+                    if not sse_started:
+                        start_sse()
+                        sse_started = True
+                    send_chunk({"content": piece})
+                    emitted_any = True
+
+                call_kwargs = {
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "on_token": (on_token if wants_stream else None),
+                }
+
+                acquired = False
+                with state_lock:
+                    runtime_state["queued"] += 1
+                try:
+                    with inference_lock:
+                        acquired = True
+                        with state_lock:
+                            runtime_state["queued"] -= 1
+                            runtime_state["active"] += 1
+                        try:
+                            if payload.get("x_kuon_mode") == "business":
+                                history = [(m["role"], _content_of(m).strip())
+                                           for m in messages[:user_index + 1]
+                                           if m.get("role") in ("user", "assistant")]
+                                try:
+                                    result = _call_compat(chosen.advise, history, **call_kwargs)
+                                except ContextLimitError:
+                                    if not sse_started:
+                                        self._json(400, {"error": {
+                                            "code": "context_length_exceeded",
+                                            "message": "The latest message exceeds the token budget. Shorten it and try again.",
+                                        }})
+                                    return
+                                except NotImplementedError:
+                                    if not sse_started:
+                                        self._json(501, {"error": {
+                                            "message": "Business chat is unavailable on the selected engine.",
+                                        }})
+                                    return
+                            else:
+                                qa_history = [(m["role"], _content_of(m).strip())
+                                              for m in messages[:user_index + 1]
+                                              if m.get("role") in ("user", "assistant")]
+                                result = _call_compat(chosen.answer, question, history=qa_history, **call_kwargs)
+                        finally:
+                            with state_lock:
+                                runtime_state["active"] -= 1
+                finally:
+                    if not acquired:
+                        with state_lock:
+                            runtime_state["queued"] -= 1
+
+                if wants_stream:
+                    if not sse_started:
+                        start_sse()
+                        sse_started = True
+                    if not emitted_any and result.answer:
+                        send_chunk({"content": result.answer})
+                    send_chunk({}, "stop", {"x_sources": result.sources, "x_notes": result.notes})
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
                 else:
                     self._completion(result, question, requested)
+            except (BrokenPipeError, ConnectionResetError):
+                return
             except Exception as error:  # never leak tracebacks to clients
-                self._json(500, {"error": {"message": str(error)}})
+                if not sse_started:
+                    self._json(500, {"error": {"message": str(error)}})
 
         # --------------------------------------------------------- responses
 
@@ -317,40 +505,14 @@ def build_handler(agent, model_name: str = "kuon-agent",
                 "x_notes": result.notes,
             })
 
-        def _stream(self, result, question: str, model_id: str = None):
-            completion_id = "chatcmpl-" + uuid.uuid4().hex
-            created = int(time.time())
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "close")
-            self._cors()
-            self.end_headers()
-
-            def chunk(delta: dict, finish=None, extra: dict | None = None):
-                frame = {
-                    "id": completion_id, "object": "chat.completion.chunk",
-                    "created": created, "model": model_id or model_name,
-                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
-                }
-                if extra:
-                    frame.update(extra)
-                self.wfile.write(b"data: " + json.dumps(frame).encode() + b"\n\n")
-                self.wfile.flush()
-
-            chunk({"role": "assistant"})
-            chunk({"content": result.answer})
-            chunk({}, "stop", {"x_sources": result.sources, "x_notes": result.notes})
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-
     return Handler
 
 
 def build_server(agent, host: str = "127.0.0.1", port: int = 8000,
                  model_name: str = "kuon-agent",
-                 agents: dict | None = None) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host, port), build_handler(agent, model_name, agents))
+                 agents: dict | None = None,
+                 *, api_key: str | None = None) -> ThreadingHTTPServer:
+    return ThreadingHTTPServer((host, port), build_handler(agent, model_name, agents, api_key=api_key))
 
 
 def agent_from_env(args) -> KuonAgent:
@@ -380,26 +542,67 @@ def agent_from_env(args) -> KuonAgent:
     if rag_path:
         from pathlib import Path
 
-        rag_index = BM25Index()
+        use_semantic = bool(getattr(args, "semantic_rag", False)) or (
+            os.environ.get("KUON_SEMANTIC_RAG", "").strip().lower() in ("1", "true", "yes", "on")
+        )
+        if use_semantic:
+            try:
+                threads_env = os.environ.get("KUON_CPU_THREADS", "4")
+                threads = int(threads_env) if threads_env.isdigit() else 4
+                embedder = OnnxE5Embedder(threads=threads)
+                rag_index = HybridIndex(embedder=embedder)
+                print("[kuon] Hybrid RAG enabled (BM25 + multilingual-e5-small ONNX)", flush=True)
+            except Exception as err:
+                print(f"[kuon] Hybrid RAG unavailable ({err}); falling back to BM25", flush=True)
+                rag_index = BM25Index()
+        else:
+            rag_index = BM25Index()
         target = Path(rag_path)
         if target.is_dir():
             for file in sorted(target.glob("**/*")):
-                if file.suffix.lower() in {".txt", ".md"}:
+                if file.suffix.lower() in {".txt", ".md", ".csv", ".tsv"}:
                     rag_index.add_file(str(file), source=str(file))
         else:
             rag_index.add_file(str(target), source=target.name)
         rag_index.finalize()
 
+    has_exa = bool(os.environ.get("EXA_API_KEY", "").strip())
+    use_web = bool(args.web or has_exa)
+    if has_exa:
+        print("[kuon] Live web search enabled via Exa AI (General QA mode only)", flush=True)
     return KuonAgent(engine, AgentConfig(
         use_rag=bool(rag_path),
         use_wiki=not args.no_wiki,
-        use_web=args.web,
-        fallback_web=args.web,
+        use_web=use_web,
+        fallback_web=use_web,
         think=False,
     ), rag_index=rag_index)
 
 
+def _load_dotenv() -> None:
+    """Load simple KEY=VALUE lines from local .env without overriding existing env vars."""
+    from pathlib import Path
+
+    candidates = [Path.cwd() / ".env", Path(__file__).resolve().parent.parent / ".env"]
+    seen: set[Path] = set()
+    for env_path in candidates:
+        resolved = env_path.resolve()
+        if resolved in seen or not env_path.is_file():
+            continue
+        seen.add(resolved)
+        for raw in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = val
+
+
 def main() -> None:
+    _load_dotenv()
     ap = argparse.ArgumentParser(description="Kuon Agent OpenAI-compatible server")
     ap.add_argument("--engine", choices=["mock", "kuon", "ollama", "llamacpp"], default=None)
     ap.add_argument("--checkpoint", default=None)
@@ -407,7 +610,9 @@ def main() -> None:
     ap.add_argument("--host", default=None, help="Ollama host (http://localhost:11434)")
     ap.add_argument("--binary", default="llama-cli")
     ap.add_argument("--device", default=None)
-    ap.add_argument("--rag", default=None, help="file or directory for BM25 RAG")
+    ap.add_argument("--rag", default=None, help="file or directory for RAG (.txt, .md, .csv, .tsv)")
+    ap.add_argument("--semantic-rag", action="store_true",
+                    help="combine BM25 with MIT multilingual-e5-small ONNX semantic search (or set KUON_SEMANTIC_RAG=1)")
     ap.add_argument("--no-wiki", action="store_true")
     ap.add_argument("--web", action="store_true", help="enable DuckDuckGo search")
     ap.add_argument("--no-think", action="store_true")
@@ -423,9 +628,10 @@ def main() -> None:
     if extra_model:
         agents["qwen"] = KuonAgent(OllamaEngine(model=extra_model),
                                    agent.cfg, rag_index=agent.rag)
-    server = build_server(agent, args.bind, args.port, agents=agents)
+    api_key = os.environ.get("KUON_API_KEY") or None
+    server = build_server(agent, args.bind, args.port, agents=agents, api_key=api_key)
     print(f"[kuon] serving on http://{args.bind}:{args.port}  (engine: {agent.engine.name})")
-    print(f"[kuon] models: {', '.join(agents)}")
+    print(f"[kuon] models: {', '.join(agents)} | auth: {'bearer' if api_key else 'open'}")
     print("[kuon] OpenAI-compatible base URL: http://host:port/v1")
     try:
         server.serve_forever()

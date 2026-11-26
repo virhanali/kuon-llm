@@ -162,20 +162,35 @@ def build_counterfactual_business_prefs() -> tuple[list[dict], list[dict]]:
                     else ("The note was logged on Tuesday." if idx % 2 == 0 else "The note was logged on Wednesday.")
                 )
                 choices = (answer_a, answer_b, question)
-                # Symmetric, balanced A/B/C preference pairs (business=False to match eval_confirmed_actions):
-                # Every gold letter is paired against BOTH wrong letters so chosen & rejected counts are
-                # strictly 1:1:1 across A, B, C (zero letter bias) and stay ~4.5% of total pref pairs.
-                if is_val or idx % 2 == 0:
-                    for fact_i, (confirmed, exp_idx) in enumerate(((fact_a, 0), (fact_b, 1), (missing_fact, 2))):
-                        body = f"{opening}\n{hdr}: {confirmed} {date_note}\n{instr}"
-                        offset = (idx + 2 * fact_i) % 3
+                # Symmetric, permutation-invariant A/B/C preference pairs:
+                # Train split covers ALL 3 cyclic rotations across both business=False
+                # (eval_confirmed_actions) and business=True (eval_action_choice), pairing
+                # every gold letter against BOTH wrong letters so chosen & rejected counts
+                # are strictly 1:1:1 across A, B, C (zero letter bias).
+                mc_biz = bool(idx % 2 == 1) if not is_val else False
+                offsets = (0, 1, 2) if not is_val else ((idx + 2) % 3,)
+                for fact_i, (confirmed, exp_idx) in enumerate(((fact_a, 0), (fact_b, 1), (missing_fact, 2))):
+                    body = f"{opening}\n{hdr}: {confirmed} {date_note}\n{instr}"
+                    if not is_val:
+                        for wrong_idx in range(3):
+                            if wrong_idx == exp_idx:
+                                continue
+                            target.append({
+                                **meta, "task": "pref_confirmed_text",
+                                "business": False,
+                                "user": body,
+                                "chosen": choices[exp_idx],
+                                "rejected": choices[wrong_idx],
+                            })
+                    for base_off in offsets:
+                        offset = (base_off + fact_i) % 3 if is_val else base_off
                         order = [(offset + k) % 3 for k in range(3)]
                         opts_txt = "\n".join(f"{ltr}. {choices[c_i]}" for ltr, c_i in zip("ABC", order))
                         gold_letter = "ABC"[order.index(exp_idx)]
                         for wrong_letter in (l for l in "ABC" if l != gold_letter):
                             target.append({
                                 **meta, "task": "pref_confirmed_mc",
-                                "business": False,
+                                "business": mc_biz,
                                 "user": f"{body}\n{opts_txt}",
                                 "chosen": gold_letter,
                                 "rejected": wrong_letter,
@@ -221,7 +236,14 @@ def build_calibration_prefs(offline: bool = False) -> tuple[list[dict], list[dic
                     "business": r.get("business", True), "user": r["user"], "evidence": r.get("evidence"),
                     "chosen": r["assistant"], "rejected": r["distractor"],
                 })
-            elif len(ans_rows) > 2:
+            if r.get("distractor_swap"):
+                # Hard counterfactual negative: right entity paired with neighbor entity's number
+                out.append({
+                    "language": r["language"], "task": f"{tag}_number_binding",
+                    "business": r.get("business", True), "user": r["user"], "evidence": r.get("evidence"),
+                    "chosen": r["assistant"], "rejected": r["distractor_swap"],
+                })
+            elif not r.get("distractor") and len(ans_rows) > 2:
                 wrong = ans_rows[(i + 1) % len(ans_rows)]["assistant"]
                 if wrong != r["assistant"]:
                     out.append({

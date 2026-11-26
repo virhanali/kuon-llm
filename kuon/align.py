@@ -176,6 +176,7 @@ def align(
     seed: int = 0,
     tokenizer_path: str | Path | None = None,
     business: bool = False,
+    grad_checkpoint: bool = False,
     quiet: bool = False,
 ) -> dict:
     if method not in ("apo_zero", "orpo"):
@@ -206,6 +207,7 @@ def align(
     is_cuda = device.startswith("cuda")
     model = Transformer(model_cfg).to(device)
     model.load_state_dict(state["model"])
+    model.grad_checkpoint = bool(grad_checkpoint)
 
     hw_bf16 = False
     if is_cuda and torch.cuda.get_device_capability()[0] >= 8:

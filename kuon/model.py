@@ -226,6 +226,7 @@ class Transformer(nn.Module):
                 nn.init.normal_(p, mean=0.0, std=scaled)
 
         # Initialize after the shared blocks so all variants start with the same weights.
+        self.grad_checkpoint = False
         self.loop_gate = None
         if cfg.looping and cfg.loop_gate_rank:
             self.loop_gate = nn.Sequential(
@@ -263,8 +264,13 @@ class Transformer(nn.Module):
                     # closed gate makes this exactly the same as one pass.
                     x = prelude + self.loop_gate(prelude) * (x - prelude)
             block = self.blocks[layer_idx]
-            x = block(x, self.rope_cos, self.rope_sin,
-                      cache[execution_idx] if cache is not None else None)
+            if self.grad_checkpoint and self.training and cache is None:
+                x = torch.utils.checkpoint.checkpoint(
+                    block, x, self.rope_cos, self.rope_sin, None, use_reentrant=False,
+                )
+            else:
+                x = block(x, self.rope_cos, self.rope_sin,
+                          cache[execution_idx] if cache is not None else None)
         x = self.norm_f(x)
         logits = self.lm_head(x)
 

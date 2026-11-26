@@ -94,6 +94,7 @@ class TrainConfig:
     log_file: str = "logs/kuon.jsonl"
     seed: int = 1337
     compile: bool = False
+    grad_checkpoint: bool = False
 
 
 def load_run_config(path: str | Path) -> tuple[str, ModelConfig, TrainConfig]:

@@ -413,6 +413,24 @@ def test_repetition_controls_and_grounded_answer_verifier():
     )
     assert ok3 is True and fb3 is None
 
+    # 5. Currency mismatch guard catches Rp -> $ conversion hallucination
+    ok_cur_bad, fb_cur_bad = verify_grounded_answer(
+        "What is the Bandung branch net profit after tax?",
+        "[1] keuangan_bandung.md\nLaba bersih cabang Bandung setelah pajak mencapai Rp42 juta.",
+        "The Bandung branch net profit after tax was $42 million, as stated in [1].",
+        indonesian=False,
+    )
+    assert ok_cur_bad is False and fb_cur_bad and "IDR" in fb_cur_bad
+
+    # 6. Preserving original IDR/Rp currency passes cleanly
+    ok_cur_good, fb_cur_good = verify_grounded_answer(
+        "What is the Bandung branch net profit after tax?",
+        "[1] keuangan_bandung.md\nLaba bersih cabang Bandung setelah pajak mencapai Rp42 juta.",
+        "The Bandung branch net profit after tax was Rp42 million, as stated in [1].",
+        indonesian=False,
+    )
+    assert ok_cur_good is True and fb_cur_good is None
+
 
 def test_confirmed_mc_prefs_are_symmetric():
     from collections import Counter
@@ -422,9 +440,58 @@ def test_confirmed_mc_prefs_are_symmetric():
     for split_name, rows in (("train", tr), ("val", va)):
         mc = [r for r in rows if r["task"] == "pref_confirmed_mc"]
         assert mc, f"{split_name} missing pref_confirmed_mc"
-        assert all(r["business"] is False for r in mc)
+        if split_name == "train":
+            assert any(r["business"] is False for r in mc) and any(r["business"] is True for r in mc)
+        else:
+            assert all(r["business"] is False for r in mc)
         chosen = Counter(r["chosen"] for r in mc)
         rejected = Counter(r["rejected"] for r in mc)
         assert set(chosen.keys()) == {"A", "B", "C"}, f"{split_name} chosen={chosen}"
         assert chosen == rejected, f"{split_name} asymmetric: chosen={chosen} rejected={rejected}"
         assert len(set(chosen.values())) == 1, f"{split_name} uneven across A/B/C: {chosen}"
+
+
+def test_deterministic_table_analytics_id_en_tsv_and_currency_guard():
+    from kuon_agent.agent import AgentConfig, KuonAgent
+
+    class DummyEngine:
+        name = "dummy"
+        def prompt_fits(self, prompt: str, max_tokens: int) -> bool:
+            return True
+        def complete(self, prompt: str, max_tokens: int = 180) -> str:
+            return "fallback"
+
+    agent = KuonAgent(DummyEngine(), AgentConfig(use_rag=False, use_wiki=False, use_web=False))
+
+    tbl_id = (
+        "Produk\tOmzet\tPesanan\n"
+        "Teh Tarik\tRp41.000.000\t820\n"
+        "Roti Panggang\tRp34.000.000\t680\n"
+        "Kopi Hitam\tRp25.000.000\t500\n"
+    )
+    # Highest + share % from Excel/Sheets TSV paste
+    r_max = agent.advise([("user", tbl_id + "Produk mana yang omzetnya terbesar?")])
+    assert "Teh Tarik" in r_max.answer and "Rp41.000.000" in r_max.answer and "41%" in r_max.answer
+    assert r_max.sources == [{"title": "tool:table_analytics", "url": ""}]
+
+    # Multi-turn follow-up on the SAME pasted table: total & average pesanan
+    r_sum = agent.advise([
+        ("user", tbl_id + "Produk mana yang omzetnya terbesar?"),
+        ("assistant", r_max.answer),
+        ("user", "Berapa total pesanan semuanya?"),
+    ])
+    assert "2.000" in r_sum.answer
+
+    # Lowest in English Markdown table
+    tbl_en = "| Branch | Revenue | Orders |\n|---|---|---|\n| North | $12,000 | 120 |\n| East | $8,000 | 95 |\n| West | $20,000 | 210 |\n"
+    r_min = agent.advise([("user", tbl_en + "Which branch had the lowest revenue?")])
+    assert "East" in r_min.answer and "$8,000" in r_min.answer and "20%" in r_min.answer
+
+    # Share breakdown
+    r_share = agent.advise([("user", tbl_en + "What is each branch's revenue share?")])
+    assert "West: 50%" in r_share.answer and "North: 30%" in r_share.answer and "East: 20%" in r_share.answer
+
+    # Mixed currency guard
+    tbl_mix = "| Branch | Revenue |\n|---|---|\n| A | Rp10.000.000 |\n| B | $5,000 |\nWhat is the total revenue?"
+    r_mix = agent.advise([("user", tbl_mix)])
+    assert "currencies" in r_mix.answer and r_mix.sources == []

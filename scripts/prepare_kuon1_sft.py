@@ -161,25 +161,30 @@ def build_counterfactual_advice_rows() -> tuple[list[dict], list[dict]]:
                 )
                 choices = (answer_a, answer_b, question)
                 mc_items = ((fact_a, 0), (fact_b, 1), (missing_fact, 2))
+                # Train split covers ALL 3 cyclic rotations so the model learns true
+                # permutation invariance (shifting its letter when A/B/C rotate) across
+                # both business=False (eval_confirmed_actions) and business=True (eval_action_choice).
+                offsets = (0, 1, 2) if not is_val else ((idx + 2) % 3,)
+                mc_biz = bool(idx % 2 == 1) if not is_val else False
                 for fact_i, (confirmed, exp_idx) in enumerate(mc_items):
                     body = f"{opening}\n{hdr}: {confirmed} {date_note}\n{instr}"
-                    # Plain text selection with Confirmed facts header (balanced subset, ~72 train rows)
-                    if not is_val and idx % 2 == 0:
+                    # Plain text selection with Confirmed facts header across all train scenarios
+                    if not is_val:
                         target.append({
                             **meta, "task": "confirmed_action_text",
                             "business": False, "user": body, "assistant": choices[exp_idx],
                         })
-                    # Balanced cyclic offset: within EVERY scenario the 3 facts map to distinct {A, B, C}
-                    offset = (idx + 2 * fact_i) % 3
-                    order = [(offset + k) % 3 for k in range(3)]
-                    opts_txt = "\n".join(f"{ltr}. {choices[c_i]}" for ltr, c_i in zip("ABC", order))
-                    gold_letter = "ABC"[order.index(exp_idx)]
-                    target.append({
-                        **meta, "task": "confirmed_action_mc",
-                        "business": False,
-                        "user": f"{body}\n{opts_txt}",
-                        "assistant": gold_letter,
-                    })
+                    for rot_i, base_off in enumerate(offsets):
+                        offset = (base_off + fact_i) % 3 if is_val else base_off
+                        order = [(offset + k) % 3 for k in range(3)]
+                        opts_txt = "\n".join(f"{ltr}. {choices[c_i]}" for ltr, c_i in zip("ABC", order))
+                        gold_letter = "ABC"[order.index(exp_idx)]
+                        target.append({
+                            **meta, "task": "confirmed_action_mc",
+                            "business": mc_biz,
+                            "user": f"{body}\n{opts_txt}",
+                            "assistant": gold_letter,
+                        })
 
     # Concise direct-fix operational consulting rows (train-only, prevents echoing user questions)
     direct_fixes = [
@@ -326,6 +331,7 @@ def build_grounded_business_rows() -> tuple[list[dict], list[dict]]:
             q_cmp = f"{noun_cmp} mana yang menyumbang kontribusi omzet {sup} di {loc_cmp} pada bulan {month_tag}?"
             a_cmp = f"Berdasarkan ringkasan {loc_cmp} [1], kontribusi omzet {sup} berasal dari {win_ent} sebesar {win_p}%."
             d_cmp = f"Berdasarkan ringkasan {loc_cmp} [1], kontribusi omzet {sup} berasal dari {lose_ent} sebesar {lose_p}%."
+            d_swap = f"Berdasarkan ringkasan {loc_cmp} [1], kontribusi omzet {sup} berasal dari {win_ent} sebesar {lose_p}%."
             ev_unit = "omzet"
         else:
             win_ent, win_p = min(pairs_id, key=lambda x: x[1])
@@ -334,6 +340,7 @@ def build_grounded_business_rows() -> tuple[list[dict], list[dict]]:
             q_cmp = f"{noun_cmp} mana yang mencatat tingkat ketepatan {sup} di {loc_cmp} pada bulan {month_tag}?"
             a_cmp = f"Berdasarkan audit {loc_cmp} [1], tingkat ketepatan {sup} tercatat pada {win_ent} sebesar {win_p}%."
             d_cmp = f"Berdasarkan audit {loc_cmp} [1], tingkat ketepatan {sup} tercatat pada {lose_ent} sebesar {lose_p}%."
+            d_swap = f"Berdasarkan audit {loc_cmp} [1], tingkat ketepatan {sup} tercatat pada {win_ent} sebesar {lose_p}%."
             ev_unit = "ketepatan"
         target.append({
             "language": "id", "task": "grounded_compare_minmax", "business": True,
@@ -341,6 +348,30 @@ def build_grounded_business_rows() -> tuple[list[dict], list[dict]]:
             "evidence": f"[1] Ringkasan {loc_cmp} ({month_tag})\n{e1}: {p1}% {ev_unit}, {e2}: {p2}% {ev_unit}, {e3}: {p3}% {ev_unit}.",
             "assistant": a_cmp,
             "distractor": d_cmp,
+            "distractor_swap": d_swap,
+        })
+        # 2b. ID 3-metric distinct cost/KPI lookup (asks 2nd or 3rd metric, punishes copying 1st!)
+        msets_id = (
+            ("biaya pengemasan dingin", "biaya asuransi kargo", "biaya bongkar muat"),
+            ("biaya layanan bank", "biaya cetak label", "biaya penyimpanan rak"),
+            ("biaya kalibrasi mesin", "biaya inspeksi mutu", "biaya sanitasi ruang"),
+            ("biaya sewa kontainer", "biaya pemindai barcode", "biaya pengawalan rute"),
+        )
+        m1_id, m2_id, m3_id = msets_id[i % len(msets_id)]
+        c1_id = 12_000 + (i * 1_500) % 18_000
+        c2_id = 4_500 + (i * 1_250) % 9_500
+        c3_id = 7_000 + (i * 1_750) % 14_000
+        ask_m_id, ask_v_id = (m2_id, c2_id) if (i % 2 == 0) else (m3_id, c3_id)
+        target.append({
+            "language": "id", "task": "grounded_multi_metric", "business": True,
+            "user": f"Berapa {ask_m_id} per pesanan di {a_id} pada periode #{i + 1}?",
+            "evidence": (
+                f"[1] Rincian Biaya Unit {a_id} Periode #{i + 1}\n"
+                f"{m1_id.capitalize()}: Rp{c1_id:,}/pesanan. {m2_id.capitalize()}: Rp{c2_id:,}/pesanan. "
+                f"{m3_id.capitalize()}: Rp{c3_id:,}/pesanan."
+            ),
+            "assistant": f"Berdasarkan Rincian Biaya Unit [1], {ask_m_id} di {a_id} adalah Rp{ask_v_id:,}/pesanan.",
+            "distractor": f"Berdasarkan Rincian Biaya Unit [1], {ask_m_id} di {a_id} adalah Rp{c1_id:,}/pesanan.",
         })
         # 3. ID unanswerable with strong distractor numbers (explicit money-vs-headcount/volume contrast!)
         unans_topics_id = [
@@ -416,18 +447,41 @@ def build_grounded_business_rows() -> tuple[list[dict], list[dict]]:
             q_en_cmp = f"Which unit had the lowest fulfillment accuracy in audit #{i + 1}?"
             a_en_cmp = f"According to the audit [1], {win_en} had the lowest fulfillment accuracy at {win_acc}%."
             d_en_cmp = f"Based on the provided excerpt [1], {lose_en} had the lowest accuracy at {lose_acc}%."
+            d_en_swap = f"According to the audit [1], {win_en} had the lowest fulfillment accuracy at {lose_acc}%."
         else:
             win_en, win_acc = max(pairs_en, key=lambda x: x[1])
             lose_en, lose_acc = min(pairs_en, key=lambda x: x[1])
             q_en_cmp = f"Which unit achieved the highest fulfillment accuracy in audit #{i + 1}?"
             a_en_cmp = f"According to the audit [1], {win_en} achieved the highest fulfillment accuracy at {win_acc}%."
             d_en_cmp = f"Based on the provided excerpt [1], {lose_en} achieved the highest accuracy at {lose_acc}%."
+            d_en_swap = f"According to the audit [1], {win_en} achieved the highest fulfillment accuracy at {lose_acc}%."
         target.append({
             "language": "en", "task": "grounded_compare_minmax", "business": True,
             "user": q_en_cmp,
             "evidence": f"[1] Weekly Fulfillment Audit #{i + 1}\n{a_en}: {acc1}% accuracy. {b_en}: {acc2}% accuracy. {c_en}: {acc3}% accuracy.",
             "assistant": a_en_cmp,
             "distractor": d_en_cmp,
+            "distractor_swap": d_en_swap,
+        })
+        # EN 3-metric distinct cost/KPI lookup (asks 2nd or 3rd metric, punishes copying 1st!)
+        msets_en = (
+            ("inbound freight", "customs brokerage", "pallet wrapping"),
+            ("cold storage fee", "return inspection", "barcode labeling"),
+            ("carrier fuel surcharge", "protective foam insert", "sorting labor"),
+            ("payment gateway fee", "fraud screening", "invoice dispatch"),
+        )
+        m1_en, m2_en, m3_en = msets_en[i % len(msets_en)]
+        ask_m_en, ask_v_en = (m2_en, u2) if (i % 2 == 0) else (m3_en, u3)
+        target.append({
+            "language": "en", "task": "grounded_multi_metric", "business": True,
+            "user": f"How much did {ask_m_en} cost per order at {a_en} in cycle #{i + 1}?",
+            "evidence": (
+                f"[1] {a_en} Unit Economics Cycle #{i + 1}\n"
+                f"Average {m1_en}: ${u1:.2f}/order. {m2_en.capitalize()}: ${u2:.2f}/order. "
+                f"{m3_en.capitalize()}: ${u3:.2f}/order."
+            ),
+            "assistant": f"According to the Unit Economics report [1], {ask_m_en} cost ${ask_v_en:.2f}/order.",
+            "distractor": f"According to the Unit Economics report [1], {ask_m_en} cost ${u1:.2f}/order.",
         })
         unans_topics_en = [
             ("What was the monthly facility rent for that hub?", f"Active staff count: {v2 + 12} people across {vol:,} completed shipments.", "monthly facility rent", f"{vol:,} shipments"),
@@ -481,6 +535,48 @@ def build_grounded_business_rows() -> tuple[list[dict], list[dict]]:
         train_rows.append({"language": lang, "task": "decision_missing_drivers", "business": True, "user": u, "assistant": a})
     for lang, u, a in decision_val:
         val_rows.append({"language": lang, "task": "decision_missing_drivers", "business": True, "user": u, "assistant": a})
+
+    # 5. Exact count/SLA/tier-rate attribute binding drills (prevents copying adjacent row numbers or omitting numbers)
+    for i in range(24):
+        target = val_rows if i >= 20 else train_rows
+        t_early = 3 + (i % 4)
+        t_late = 14 + (i * 3) % 13
+        tot_ship = 1_100 + i * 75
+        ret_ship = 21 + (i * 5) % 38
+        branch_id = ("Depo Bandung", "Depo Semarang", "Depo Medan", "Depo Denpasar")[i % 4]
+        target.append({
+            "language": "id", "task": "grounded_multi_attribute", "business": True,
+            "user": f"Berapa rata-rata waktu respons tiket pada shift akhir di {branch_id} periode #{i + 1}?",
+            "evidence": (
+                f"[1] Log Layanan {branch_id} #{i + 1}\n"
+                f"Shift awal: rata-rata respons {t_early} menit. Shift akhir: rata-rata respons {t_late} menit dengan {60 + i} tiket."
+            ),
+            "assistant": f"Berdasarkan Log Layanan {branch_id} [1], rata-rata waktu respons tiket pada shift akhir adalah {t_late} menit.",
+            "distractor": f"Berdasarkan Log Layanan {branch_id} [1], rata-rata waktu respons tiket pada shift akhir adalah {t_early} menit.",
+        })
+        target.append({
+            "language": "id", "task": "grounded_multi_attribute", "business": True,
+            "user": f"Berapa jumlah paket gagal antar karena nomor tidak aktif di {branch_id} periode #{i + 1}?",
+            "evidence": (
+                f"[1] Ringkasan Kiriman {branch_id} #{i + 1}\n"
+                f"Total kiriman keluar: {tot_ship:,} paket. Paket gagal antar karena nomor tidak aktif: {ret_ship} paket."
+            ),
+            "assistant": f"Berdasarkan Ringkasan Kiriman {branch_id} [1], jumlah paket gagal antar karena nomor tidak aktif adalah {ret_ship} paket.",
+            "distractor": f"Berdasarkan Ringkasan Kiriman {branch_id} [1], jumlah paket gagal antar karena nomor tidak aktif adalah {tot_ship:,} paket.",
+        })
+        c_basic = round(4.2 + (i % 5) * 0.6, 1)
+        c_pro = round(1.3 + (i % 4) * 0.3, 1)
+        hub_en = ("Austin Hub", "Denver Hub", "Seattle Hub", "Boston Hub")[i % 4]
+        target.append({
+            "language": "en", "task": "grounded_multi_attribute", "business": True,
+            "user": f"What is the monthly cancellation rate for Business tier accounts at {hub_en} cycle #{i + 1}?",
+            "evidence": (
+                f"[1] Retention Brief {hub_en} #{i + 1}\n"
+                f"Starter tier monthly cancellation: {c_basic}%. Business tier monthly cancellation: {c_pro}% across {90 + i} accounts."
+            ),
+            "assistant": f"According to the Retention Brief [1], the Business tier monthly cancellation rate is {c_pro}%.",
+            "distractor": f"According to the Retention Brief [1], the Business tier monthly cancellation rate is {c_basic}%.",
+        })
 
     return train_rows, val_rows
 
@@ -1167,14 +1263,18 @@ def build_rehearsal_rows(id_limit: int = 350, en_limit: int = 350) -> list[dict]
     textbook excerpts from crumb/openstax-text (CC BY 4.0).
     """
     rows: list[dict] = []
-    # 1. Indonesian FineWeb2-HQ rehearsal (shard 2, unseen by Stage 1/2!)
-    url_id = hf_shard_url("fineweb2_hq_id", 2)
+    # 1. Indonesian FineWeb2-HQ rehearsal (shard 100, strictly unseen by Stage 1, Part 4, and Stage 2!)
+    id_spam_re = re.compile(
+        r"\b(slot\s*gacor|judol|judi\s*online|togel|sbobet|maxwin|pragmatic\s*play|rtp\s*live|bandar\s*togel|situs\s*slot|deposit\s*pulsa|daftar\s*slot|bo\s*togel)\b",
+        re.IGNORECASE,
+    )
+    url_id = hf_shard_url("fineweb2_hq_id", 100)
     pf = pq.ParquetFile(HttpRangeFile(url_id))
     got_id = 0
     for batch in pf.iter_batches(batch_size=128, columns=["text"]):
         for raw in batch.column(0).to_pylist():
             t = clean_text(raw or "")
-            if not t:
+            if not t or id_spam_re.search(t):
                 continue
             rows.append({"language": "id", "task": "rehearsal_id", "raw_text": True, "text": t[:1400]})
             got_id += 1

@@ -1,0 +1,37 @@
+{
+  "name": "kuon-2-loop",
+  "model": {
+    "vocab_size": 24576,
+    "block_size": 1024,
+    "n_layer": 24,
+    "n_embd": 1024,
+    "n_head": 16,
+    "n_kv_head": 4,
+    "ffn_hidden": 2816,
+    "dropout": 0.0,
+    "tie_word_embeddings": true,
+    "loop_start": 8,
+    "loop_end": 16,
+    "loop_passes": 2,
+    "loop_gate_rank": 32
+  },
+  "train": {
+    "data_dir": "data/kuon1-midtrain-1b",
+    "steps": 12210,
+    "batch_size": 8,
+    "grad_accum": 10,
+    "lr": 6e-5,
+    "min_lr": 5e-6,
+    "warmup_steps": 300,
+    "weight_decay": 0.1,
+    "eval_interval": 250,
+    "eval_batches": 20,
+    "sample_prompt": "Penjualan toko minggu ini turun 15%.",
+    "sample_tokens": 96,
+    "checkpoint_dir": "checkpoints/kuon-2-loop",
+    "log_file": "logs/kuon-2-loop.jsonl",
+    "seed": 1337,
+    "compile": false,
+    "grad_checkpoint": true
+  }
+}

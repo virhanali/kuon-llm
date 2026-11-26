@@ -16,7 +16,7 @@ from typing import Callable
 
 from kuon.chat import format_prompt
 from kuon_agent.rag import BM25Index
-from kuon_agent.search import Source, duckduckgo_search, wikipedia_search
+from kuon_agent.search import Source, web_search, wikipedia_search
 from kuon_agent.tools import (
     FactLedger,
     business_kpi,
@@ -35,7 +35,9 @@ _TOOL_CALL_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _ID_WORDS = re.compile(
-    r"\b(?:apa|apakah|berapa|berikut|biaya|bulan|dari|harga|hitung|hpp|kami|ke|kotor|minggu|omzet|pendapatan|persen|pesanan|turun|yang)\b",
+    r"\b(?:apa|apakah|siapa|kapan|dimana|mengapa|kenapa|bagaimana|berapa|berikut|sekarang|adalah|"
+    r"dengan|untuk|tidak|bisa|sudah|belum|saya|anda|kamu|biaya|bulan|dari|harga|hitung|hpp|kami|"
+    r"ke|kotor|minggu|omzet|omset|pendapatan|persen|pesanan|turun|yang)\b",
     re.I,
 )
 _CHANGE_TERMS = re.compile(
@@ -44,9 +46,9 @@ _CHANGE_TERMS = re.compile(
 )
 _SALES_CHANGE_REQUEST = re.compile(
     r"(?:"
-    r"(?:berapa|hitung(?:kan)?|cari|tentukan)?\s*(?:persen(?:tase)?\s+)?(?:perubahan|kenaikan|penurunan)\s+(?:omzet|pendapatan|penjualan)"
-    r"|(?:omzet|pendapatan|penjualan)\s+.*?(?:perubahan|turun|naik).*?(?:persen|%)"
-    r"|(?:berapa\s+persen(?:tase)?)\s+(?:perubahan\s+|kenaikan\s+|penurunan\s+)?(?:omzet|pendapatan|penjualan)"
+    r"(?:berapa|hitung(?:kan)?|cari|tentukan)?\s*(?:persen(?:tase)?\s+)?(?:perubahan|kenaikan|penurunan)\s+(?:omzet|omset|pendapatan|penjualan)"
+    r"|(?:omzet|omset|pendapatan|penjualan)\s+.*?(?:perubahan|turun|naik).*?(?:persen|%)"
+    r"|(?:berapa\s+persen(?:tase)?)\s+(?:perubahan\s+|kenaikan\s+|penurunan\s+)?(?:omzet|omset|pendapatan|penjualan)"
     r"|(?:what\s+(?:is|was)|calculate|compute|find)?\s*(?:the\s+)?(?:revenue|sales(?:\s+revenue)?)\s+(?:percent(?:age)?\s+)?change"
     r"|(?:percent(?:age)?\s+change\s+(?:in|of)\s+(?:revenue|sales))"
     r"|by\s+what\s+percent(?:age)?\s+did\s+(?:revenue|sales)"
@@ -54,7 +56,11 @@ _SALES_CHANGE_REQUEST = re.compile(
     r")",
     re.I,
 )
-_REVENUE_HEADERS = frozenset({"omzet", "pendapatan", "revenue", "sales", "sales revenue", "penjualan"})
+_REVENUE_HEADERS = frozenset({
+    "omzet", "omset", "total omzet", "total omset", "pendapatan", "total pendapatan",
+    "revenue", "total revenue", "gross revenue", "sales", "sales revenue", "gross sales",
+    "penjualan", "total penjualan",
+})
 _FROM_TO_RE = re.compile(
     r"(?<!\w)(?:dari|from)\s+([A-Za-z0-9][A-Za-z0-9 _\-]{0,24}?)\s+(?:ke|to|hingga|sampai)\s+([A-Za-z0-9][A-Za-z0-9 _\-]{0,24}?)(?=\s*(?:[?.!,;]|dan\b|and\b|dibanding|versus|vs\b|$))",
     re.I,
@@ -87,7 +93,7 @@ _AMOUNT_CAPTURE = (
 )
 _FIELD_PATTERNS: dict[str, tuple[re.Pattern, ...]] = {
     "revenue": (
-        re.compile(rf"\b(?:omzet|pendapatan|gross\s+revenue|total\s+revenue|revenue|penjualan)\b(?:\s+(?:bulan|minggu|pekan|tahun|kuartal)\s+(?:ini|lalu))?\s*(?:is|was|adalah|sebesar|=|:|of)?\s*{_AMOUNT_CAPTURE}", re.I),
+        re.compile(rf"\b(?:omzet|omset|pendapatan|gross\s+revenue|total\s+revenue|revenue|penjualan)\b(?:\s+(?:bulan|minggu|pekan|tahun|kuartal)\s+(?:ini|lalu))?\s*(?:is|was|adalah|sebesar|=|:|of)?\s*{_AMOUNT_CAPTURE}", re.I),
     ),
     "cogs": (
         re.compile(rf"\b(?:hpp|cogs|cost\s+of\s+goods\s+sold|harga\s+pokok(?:\s+penjualan)?|biaya\s+pokok(?:\s+penjualan)?)\b(?:\s+(?:bulan|minggu|pekan)\s+(?:ini|lalu))?\s*(?:is|was|adalah|sebesar|=|:|of)?\s*{_AMOUNT_CAPTURE}", re.I),
@@ -137,11 +143,22 @@ _MONETARY_FIELDS = frozenset({"revenue", "cogs", "total_cost", "fixed_cost", "un
 
 
 def _extract_embedded_table(text: str) -> str | None:
-    """Detect a Markdown table or multi-row numeric CSV block inside a client message."""
+    """Detect a Markdown, tab-separated (Excel/Sheets), or multi-row CSV table inside a client message."""
     lines = text.splitlines()
     md_block = [ln.strip() for ln in lines if ln.strip().startswith("|") and ln.strip().endswith("|")]
     if len(md_block) >= 3:
         return "\n".join(md_block)
+    tsv_block: list[str] = []
+    for ln in lines:
+        s = ln.strip()
+        if "\t" in s and len(s.split("\t")) >= 2 and not s.endswith("?"):
+            tsv_block.append(s)
+        elif len(tsv_block) >= 3:
+            break
+        else:
+            tsv_block = []
+    if len(tsv_block) >= 3:
+        return "\n".join(tsv_block)
     csv_block: list[str] = []
     for ln in lines:
         s = ln.strip()
@@ -264,9 +281,16 @@ Bullet points:"""
 SMALLTALK_PATTERNS = [
     re.compile(r"^(halo+|hallo+|hai+|hi+|hello+|hey+|selamat\s+(pagi|siang|sore|malam)|good\s+(morning|afternoon|evening)|assalamualaikum)\b", re.I),
     re.compile(r"\b(thank you|thanks|terima kasih|makasih)\b", re.I),
-    re.compile(r"\b(who are you|what is kuon|who is kuon|tell me about yourself|apa itu kuon|siapa kamu)\b", re.I),
+    re.compile(r"\b(who are you|what is kuon|who is kuon|tell me about yourself|apa itu kuon|siapa kamu|siapa yang membuatmu|who made you|who built you)\b", re.I),
+    re.compile(r"\b(dasarnya model apa|pakai model apa|berbasis (?:model )?apa|model dasarmu|what (?:base )?model are you|built on|based on (?:gpt|claude|gemma|llama|qwen))\b", re.I),
     re.compile(r"\b(tell me|write|tulis|ceritakan)\b.{0,40}\b(story|cerita)\b", re.I),
 ]
+
+
+_GREETING_PREFIX_RE = re.compile(
+    r"^(?:halo+|hallo+|hai+|hi+|hello+|hey+|selamat\s+(?:pagi|siang|sore|malam)|good\s+(?:morning|afternoon|evening)|assalamualaikum)[,!.\s]+",
+    re.I,
+)
 
 
 def is_smalltalk(question: str) -> bool:
@@ -275,11 +299,50 @@ def is_smalltalk(question: str) -> bool:
     return any(pattern.search(question.strip()) for pattern in SMALLTALK_PATTERNS)
 
 
+def _normalize_smalltalk_prompt(question: str) -> str:
+    """Strip leading greeting filler when followed by a direct identity question."""
+    q = question.strip()
+    stripped = _GREETING_PREFIX_RE.sub("", q).strip()
+    if stripped and is_smalltalk(stripped):
+        return stripped
+    return q
+
+
 @dataclass
 class AgentResult:
     answer: str
     notes: str = ""
     sources: list[dict] = field(default_factory=list)
+
+
+_FOLLOWUP_RE = re.compile(
+    r"^(?:kalau|kalo|terus|lalu|nah|dan|bagaimana\s+dengan|gimana\s+dengan|what\s+about|how\s+about|and\b|what\s+else)\b"
+    r"|\b(?:dia|beliau|mereka|itu|tersebut|satunya|lainnya|sebelumnya|tadi|he|she|they|it|that|those|their|the\s+other)\b",
+    re.I,
+)
+
+
+def _expand_followup_query(question: str, prior_user_msgs: list[str]) -> str:
+    """Attach prior user topic to short/anaphoric follow-ups for better RAG & web search."""
+    q = question.strip()
+    if not q or not prior_user_msgs:
+        return q
+    prev = next((m.strip() for m in reversed(prior_user_msgs) if m.strip() and not is_smalltalk(m)), "")
+    if not prev:
+        return q
+    # Skip if previous message was a giant pasted table
+    if _extract_embedded_table(prev) is not None:
+        prev_prose = " ".join(
+            ln.strip() for ln in prev.splitlines()
+            if ln.strip() and not ln.strip().startswith("|") and "\t" not in ln and ln.count(",") < 2
+        ).strip()
+        prev = prev_prose
+    if not prev:
+        return q
+    words = q.split()
+    if len(words) <= 10 and (_FOLLOWUP_RE.search(q) or len(words) <= 5):
+        return f"{prev[:140]} {q}"
+    return q
 
 
 def _match_period_row(mention: str, rows: list[list[str]], period_header: str) -> int | None:
@@ -518,6 +581,213 @@ def _format_num(val: float, indonesian: bool) -> str:
     return txt.replace(".", ",") if indonesian else txt
 
 
+_TABLE_OP_PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
+    ("share", re.compile(r"\b(?:kontribusi|pangsa|porsi|persentase\s+kontribusi|share(?:\s+of)?|contribution)\b", re.I)),
+    ("max", re.compile(r"\b(?:tertinggi|terbesar|paling\s+(?:tinggi|besar|banyak)|terlaris|highest|largest|biggest|maximum|top\s+\d*|most)\b", re.I)),
+    ("min", re.compile(r"\b(?:terendah|terkecil|paling\s+(?:rendah|kecil|sedikit)|lowest|smallest|minimum|least)\b", re.I)),
+    ("avg", re.compile(r"\b(?:rata[\s-]?rata|rerata|average|mean)\b", re.I)),
+    ("sum", re.compile(r"\b(?:total|jumlah\s+(?:keseluruhan|semua|total)|sum(?:\s+of)?)\b", re.I)),
+)
+_COL_SYNONYMS: tuple[frozenset[str], ...] = (
+    _REVENUE_HEADERS,
+    frozenset({"pesanan", "orders", "order", "transaksi", "transactions", "jumlah pesanan"}),
+    frozenset({"biaya", "cost", "costs", "hpp", "cogs", "pengeluaran", "expense", "expenses"}),
+    frozenset({"laba", "profit", "net profit", "laba bersih", "gross profit", "laba kotor"}),
+    frozenset({"unit", "units", "qty", "quantity", "terjual", "sold", "volume", "paket"}),
+    frozenset({"pelanggan", "pembeli", "pengunjung", "customers", "buyers", "visitors"}),
+)
+
+
+def _format_table_val(value: float, unit: str | None, indonesian: bool) -> str:
+    is_int = abs(value - round(value)) < 1e-6
+    if is_int:
+        base = f"{int(round(value)):,}"
+        formatted = base.replace(",", ".") if indonesian else base
+    else:
+        base = f"{value:,.2f}".rstrip("0").rstrip(".")
+        if indonesian:
+            formatted = base.replace(",", "_").replace(".", ",").replace("_", ".")
+        else:
+            formatted = base
+    if unit == "IDR":
+        return f"Rp{formatted}"
+    if unit == "USD":
+        return f"${formatted}"
+    if unit == "EUR":
+        return f"€{formatted}"
+    if unit == "%":
+        return f"{formatted}%"
+    if unit:
+        return f"{unit} {formatted}"
+    return formatted
+
+
+def _answer_table_analytics(user_msgs: list[str], indonesian: bool) -> AgentResult | None:
+    """Deterministic table aggregation (sum, mean, max, min, share %) on pasted tables."""
+    if not user_msgs:
+        return None
+    table_text: str | None = None
+    for msg in reversed(user_msgs):
+        tbl = _extract_embedded_table(msg)
+        if tbl is not None:
+            table_text = tbl
+            break
+    if not table_text:
+        return None
+
+    latest = user_msgs[-1]
+    prose_lines = [
+        ln.strip() for ln in latest.splitlines()
+        if ln.strip() and not ln.strip().startswith("|") and "\t" not in ln and ln.count(",") < 2
+    ]
+    query_text = " ".join(prose_lines).strip()
+    if not query_text:
+        return None
+
+    matched_ops = [op for op, pat in _TABLE_OP_PATTERNS if pat.search(query_text)]
+    if not matched_ops:
+        return None
+
+    try:
+        headers, rows = parse_table(table_text)
+    except ValueError:
+        return None
+    if len(headers) < 2 or not rows:
+        return None
+
+    numeric_cols: dict[int, list[tuple[str, float, str | None]]] = {}
+    for ci in range(1, len(headers)):
+        entries: list[tuple[str, float, str | None]] = []
+        for r in rows:
+            if ci >= len(r):
+                continue
+            label = r[0].strip() if r else ""
+            val, unit = parse_amount(r[ci])
+            if label and val is not None:
+                entries.append((label, val, unit))
+        if len(entries) >= 2:
+            numeric_cols[ci] = entries
+    if not numeric_cols:
+        return None
+
+    q_low = query_text.casefold()
+    chosen_ci: int | None = None
+    for ci in numeric_cols:
+        h_low = headers[ci].strip().casefold()
+        if h_low and re.search(rf"(?<!\w){re.escape(h_low)}(?!\w)", q_low):
+            chosen_ci = ci
+            break
+    if chosen_ci is None:
+        for syn_group in _COL_SYNONYMS:
+            if any(re.search(rf"(?<!\w){re.escape(s)}(?!\w)", q_low) for s in syn_group):
+                cands = [ci for ci in numeric_cols if headers[ci].strip().casefold() in syn_group]
+                if len(cands) == 1:
+                    chosen_ci = cands[0]
+                    break
+    if chosen_ci is None:
+        if len(numeric_cols) == 1:
+            chosen_ci = next(iter(numeric_cols))
+        else:
+            rev_cands = [ci for ci in numeric_cols if headers[ci].strip().casefold() in _REVENUE_HEADERS]
+            if len(rev_cands) == 1:
+                chosen_ci = rev_cands[0]
+            else:
+                return None
+
+    col_name = headers[chosen_ci].strip()
+    entries = numeric_cols[chosen_ci]
+    units = {u for _, _, u in entries if u}
+    if len(units) > 1:
+        u_list = ", ".join(sorted(units))
+        msg = (
+            f"Kolom {col_name} memakai mata uang berbeda ({u_list}). Bisa samakan satuannya dulu sebelum dihitung?"
+            if indonesian else
+            f"The {col_name} column mixes currencies ({u_list}). Can you standardize them to one currency first?"
+        )
+        return AgentResult(answer=msg)
+    unit = next(iter(units)) if units else None
+
+    total_val = sum(v for _, v, _ in entries)
+    avg_val = total_val / len(entries)
+    max_entry = max(entries, key=lambda x: x[1])
+    min_entry = min(entries, key=lambda x: x[1])
+
+    primary_op = next((op for op in ("max", "min", "avg", "sum", "share") if op in matched_ops), matched_ops[0])
+
+    if primary_op == "max":
+        v_txt = _format_table_val(max_entry[1], unit, indonesian)
+        share_pct = (max_entry[1] / total_val * 100.0) if total_val > 0 else None
+        share_str = (
+            f" ({_format_num(share_pct, indonesian)}% dari total)" if share_pct is not None else ""
+        ) if indonesian else (
+            f" ({_format_num(share_pct, indonesian)}% of total)" if share_pct is not None else ""
+        )
+        answer = (
+            f"{col_name} tertinggi: {max_entry[0]} sebesar {v_txt}{share_str}."
+            if indonesian else
+            f"Highest {col_name}: {max_entry[0]} at {v_txt}{share_str}."
+        )
+        note = f"table_analytics(op=max, col={col_name}, n={len(entries)}): label={max_entry[0]}, value={max_entry[1]}, total={round(total_val, 4)}"
+    elif primary_op == "min":
+        v_txt = _format_table_val(min_entry[1], unit, indonesian)
+        share_pct = (min_entry[1] / total_val * 100.0) if total_val > 0 else None
+        share_str = (
+            f" ({_format_num(share_pct, indonesian)}% dari total)" if share_pct is not None else ""
+        ) if indonesian else (
+            f" ({_format_num(share_pct, indonesian)}% of total)" if share_pct is not None else ""
+        )
+        answer = (
+            f"{col_name} terendah: {min_entry[0]} sebesar {v_txt}{share_str}."
+            if indonesian else
+            f"Lowest {col_name}: {min_entry[0]} at {v_txt}{share_str}."
+        )
+        note = f"table_analytics(op=min, col={col_name}, n={len(entries)}): label={min_entry[0]}, value={min_entry[1]}, total={round(total_val, 4)}"
+    elif primary_op == "avg":
+        v_txt = _format_table_val(avg_val, unit, indonesian)
+        t_txt = _format_table_val(total_val, unit, indonesian)
+        answer = (
+            f"Rata-rata {col_name}: {v_txt} (dari {len(entries)} baris, total {t_txt})."
+            if indonesian else
+            f"Average {col_name}: {v_txt} (across {len(entries)} rows, total {t_txt})."
+        )
+        note = f"table_analytics(op=avg, col={col_name}, n={len(entries)}): mean={round(avg_val, 4)}, total={round(total_val, 4)}"
+    elif primary_op == "sum":
+        t_txt = _format_table_val(total_val, unit, indonesian)
+        avg_txt = _format_table_val(avg_val, unit, indonesian)
+        answer = (
+            f"Total {col_name}: {t_txt} (dari {len(entries)} baris, rata-rata {avg_txt})."
+            if indonesian else
+            f"Total {col_name}: {t_txt} (across {len(entries)} rows, average {avg_txt})."
+        )
+        note = f"table_analytics(op=sum, col={col_name}, n={len(entries)}): sum={round(total_val, 4)}, mean={round(avg_val, 4)}"
+    else:
+        if total_val == 0:
+            return AgentResult(
+                answer=(
+                    f"Total {col_name} nol sehingga porsi persentase tidak dapat dihitung."
+                    if indonesian else
+                    f"Total {col_name} is zero, so percentage shares cannot be computed."
+                )
+            )
+        ranked = sorted(entries, key=lambda x: x[1], reverse=True)
+        parts = [
+            f"{lbl}: {_format_num((val / total_val) * 100.0, indonesian)}% ({_format_table_val(val, unit, indonesian)})"
+            for lbl, val, _ in ranked
+        ]
+        answer = (
+            f"Porsi {col_name} terhadap total ({_format_table_val(total_val, unit, indonesian)}):\n- " + "\n- ".join(parts)
+            if indonesian else
+            f"{col_name} share of total ({_format_table_val(total_val, unit, indonesian)}):\n- " + "\n- ".join(parts)
+        )
+        note = f"table_analytics(op=share, col={col_name}, n={len(entries)}): total={round(total_val, 4)}"
+
+    return AgentResult(
+        answer=answer,
+        notes=note,
+        sources=[{"title": "tool:table_analytics", "url": ""}],
+    )
+
+
 def _answer_direct_kpi(user_msgs: list[str], indonesian: bool) -> AgentResult | None:
     """Compute grounded standard KPIs (margin, conversion, break-even, AOV, ROI) with provenance."""
     # Find the latest explicit KPI request across user turns
@@ -646,7 +916,7 @@ class KuonAgent:
     def __init__(self, engine, config: AgentConfig | None = None,
                  rag_index: BM25Index | None = None,
                  wiki_fn: Callable[[str, int], list[Source]] = wikipedia_search,
-                 web_fn: Callable[[str, int], list[Source]] = duckduckgo_search):
+                 web_fn: Callable[[str, int], list[Source]] = web_search):
         self.engine = engine
         self.cfg = config or AgentConfig()
         self.rag = rag_index
@@ -660,10 +930,20 @@ class KuonAgent:
         if self.cfg.use_rag and self.rag is not None:
             for _score, chunk in self.rag.search(question, top_k=self.cfg.top_k_rag):
                 gathered.append(Source(title=chunk.source, url="", text=chunk.text))
-        if self.cfg.use_wiki:
-            gathered.extend(self._wiki(question, self.cfg.max_sources))
         if self.cfg.use_web:
             gathered.extend(self._web(question, self.cfg.max_sources))
+        if self.cfg.use_wiki:
+            is_id = bool(_ID_WORDS.search(question))
+            if is_id:
+                try:
+                    id_hits = self._wiki(question, self.cfg.max_sources, lang="id")
+                    gathered.extend(id_hits)
+                    if not id_hits:
+                        gathered.extend(self._wiki(question, self.cfg.max_sources, lang="en"))
+                except TypeError:
+                    gathered.extend(self._wiki(question, self.cfg.max_sources))
+            else:
+                gathered.extend(self._wiki(question, self.cfg.max_sources))
         if self.cfg.fallback_web and not gathered:
             gathered.extend(self._web(question, self.cfg.max_sources))
 
@@ -691,7 +971,74 @@ class KuonAgent:
 
     # ---------------------------------------------------------------- loop
 
-    def advise(self, messages: list[tuple[str, str]]) -> AgentResult:
+    def _complete(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int,
+        temperature: float | None = None,
+        on_token: Callable[[str], None] | None = None,
+        guard_tool_prefix: bool = False,
+    ) -> tuple[str, bool]:
+        """Run engine completion, optionally streaming live token deltas.
+
+        When `guard_tool_prefix=True`, buffers only leading characters that could
+        still be a `TOOL:` invocation so raw tool syntax is never leaked to a stream.
+        """
+        stream_fn = getattr(self.engine, "complete_stream", None)
+        if on_token is not None and callable(stream_fn):
+            kwargs: dict = {"max_tokens": max_tokens}
+            if temperature is not None:
+                kwargs["temperature"] = temperature
+            try:
+                gen = stream_fn(prompt, **kwargs)
+            except TypeError:
+                gen = stream_fn(prompt, max_tokens=max_tokens)
+            chunks: list[str] = []
+            buf = ""
+            flushed = not guard_tool_prefix
+            streamed = False
+            for delta in gen:
+                if not delta:
+                    continue
+                chunks.append(delta)
+                if not flushed:
+                    buf += delta
+                    lead = buf.lstrip()
+                    low = lead.lower()
+                    if not lead:
+                        continue
+                    if (len(low) < 5 and "tool:".startswith(low)) or low.startswith("tool:"):
+                        continue
+                    flushed = True
+                    on_token(buf)
+                    streamed = True
+                    buf = ""
+                else:
+                    on_token(delta)
+                    streamed = True
+            if not flushed and buf and not buf.lstrip().lower().startswith("tool:"):
+                on_token(buf)
+                streamed = True
+            return "".join(chunks).strip(), streamed
+
+        if temperature is not None:
+            try:
+                text = self.engine.complete(prompt, max_tokens=max_tokens, temperature=temperature)
+            except TypeError:
+                text = self.engine.complete(prompt, max_tokens=max_tokens)
+        else:
+            text = self.engine.complete(prompt, max_tokens=max_tokens)
+        return text.strip(), False
+
+    def advise(
+        self,
+        messages: list[tuple[str, str]],
+        *,
+        on_token: Callable[[str], None] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AgentResult:
         # The user's business facts come from the chat, optional client documents
         # (BM25 RAG), and deterministic analytical tools (never public web guesses).
         fits = getattr(self.engine, "prompt_fits", None)
@@ -719,15 +1066,25 @@ class KuonAgent:
             and any(_ID_WORDS.search(m) for m in user_msgs[:-1])
         )
 
-        # 1. Deterministic grounded sales-table comparison & direct KPI calculation (multi-turn aware)
+        # 1. Deterministic grounded sales-table comparison, table analytics, & direct KPI calculation
         sales_answer = _answer_sales_change(user_msgs, indonesian)
         if sales_answer is not None:
+            if on_token is not None and sales_answer.answer:
+                on_token(sales_answer.answer)
             return sales_answer
+
+        table_analytics_answer = _answer_table_analytics(user_msgs, indonesian)
+        if table_analytics_answer is not None:
+            if on_token is not None and table_analytics_answer.answer:
+                on_token(table_analytics_answer.answer)
+            return table_analytics_answer
 
         embedded_tbl = _extract_embedded_table(latest_user_text)
         if not embedded_tbl:
             kpi_answer = _answer_direct_kpi(user_msgs, indonesian)
             if kpi_answer is not None:
+                if on_token is not None and kpi_answer.answer:
+                    on_token(kpi_answer.answer)
                 return kpi_answer
 
         if embedded_tbl:
@@ -748,13 +1105,14 @@ class KuonAgent:
 
         # 2. Optional client document retrieval (only when the operator loaded a RAG index)
         if self.cfg.use_rag and self.rag is not None and latest_user_text:
-            for _score, chunk in self.rag.search(latest_user_text, top_k=min(2, self.cfg.top_k_rag)):
+            rag_query = _expand_followup_query(latest_user_text, user_msgs[:-1])
+            for _score, chunk in self.rag.search(rag_query, top_k=min(2, self.cfg.top_k_rag)):
                 snippet = chunk.text[:350].strip()
                 if snippet:
                     ledger.add(snippet, source=chunk.source)
                     sources.append({"title": chunk.source, "url": ""})
 
-        max_tokens = min(180, self.cfg.max_answer_tokens)
+        token_budget = min(max_tokens, 512) if max_tokens is not None else min(180, self.cfg.max_answer_tokens)
 
         def _build_fitting_prompt(evidence_text: str | None) -> str:
             conversation = "\n".join(turns[-1])
@@ -763,11 +1121,11 @@ class KuonAgent:
                 evidence=evidence_text,
                 business=True,
             )
-            if not fits(prompt, max_tokens):
+            if not fits(prompt, token_budget):
                 # Fall back to dropping evidence if client message alone barely fits
                 if evidence_text is not None:
                     prompt = format_prompt(conversation.removeprefix("User: "), business=True)
-                if not fits(prompt, max_tokens):
+                if not fits(prompt, token_budget):
                     raise ContextLimitError
                 return prompt
             for turn in reversed(turns[:-1]):
@@ -777,14 +1135,21 @@ class KuonAgent:
                     evidence=evidence_text,
                     business=True,
                 )
-                if not fits(expanded, max_tokens):
+                if not fits(expanded, token_budget):
                     break
                 conversation, prompt = candidate, expanded
             return prompt
 
         ev_text = ledger.format_evidence() or None
         prompt = _build_fitting_prompt(ev_text)
-        answer = self.engine.complete(prompt, max_tokens=max_tokens).strip()
+        # Only stream live when no evidence post-verification override can replace the answer
+        answer, streamed = self._complete(
+            prompt,
+            max_tokens=token_budget,
+            temperature=temperature,
+            on_token=(on_token if ev_text is None else None),
+            guard_tool_prefix=True,
+        )
 
         # 3. Single bounded deterministic tool-call pass with strict argument provenance check
         match = _TOOL_CALL_RE.search(answer)
@@ -811,7 +1176,11 @@ class KuonAgent:
                 ledger.add(tool_out, source=source)
                 sources.append({"title": source, "url": ""})
                 tool_notes.append(tool_out)
-                answer = self.engine.complete(_build_fitting_prompt(ledger.format_evidence()), max_tokens=max_tokens).strip()
+                answer, _ = self._complete(
+                    _build_fitting_prompt(ledger.format_evidence()),
+                    max_tokens=token_budget,
+                    temperature=temperature,
+                )
 
         # 4. Post-generation grounding verification whenever external/tool evidence was supplied
         final_ev = ledger.format_evidence()
@@ -822,20 +1191,43 @@ class KuonAgent:
             if not ok and safe_fallback:
                 answer = safe_fallback
 
+        if on_token is not None and not streamed and answer:
+            on_token(answer)
+
         return AgentResult(
             answer=answer,
             notes="\n".join(tool_notes),
             sources=sources,
         )
 
-    def answer(self, question: str) -> AgentResult:
+    def answer(
+        self,
+        question: str,
+        *,
+        history: list[tuple[str, str]] | None = None,
+        on_token: Callable[[str], None] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AgentResult:
+        token_budget = min(max_tokens, 512) if max_tokens is not None else self.cfg.max_answer_tokens
+        prior_users = [c for r, c in (history or [])[:-1] if r == "user" and c.strip()]
+        indonesian = bool(_ID_WORDS.search(question)) or (
+            not re.search(r"[A-Za-z]{3,}", question) and any(_ID_WORDS.search(m) for m in prior_users)
+        )
         if is_smalltalk(question):
             # answer in the model's own chat format, without search
-            text = self.engine.complete(format_prompt(question),
-                                        max_tokens=self.cfg.max_answer_tokens).strip()
+            text, streamed = self._complete(
+                format_prompt(_normalize_smalltalk_prompt(question)),
+                max_tokens=token_budget,
+                temperature=temperature,
+                on_token=on_token,
+            )
+            if on_token is not None and not streamed and text:
+                on_token(text)
             return AgentResult(answer=text, notes="", sources=[])
 
-        sources = self._gather(question)
+        search_query = _expand_followup_query(question, prior_users)
+        sources = self._gather(search_query)
         if not sources:
             # short, non-question inputs are almost always conversational
             # ("haloooo", "p"); real questions must admit ignorance instead
@@ -843,31 +1235,84 @@ class KuonAgent:
                 r"^(who|what|where|when|why|how|which|siapa|apa|kapan|dimana|di mana|berapa|mengapa|kenapa)\b",
                 question.strip(), re.I)) or question.strip().endswith("?")
             if not looks_factual and len(question.split()) <= 3:
-                text = self.engine.complete(format_prompt(question),
-                                            max_tokens=self.cfg.max_answer_tokens).strip()
+                text, streamed = self._complete(
+                    format_prompt(question),
+                    max_tokens=token_budget,
+                    temperature=temperature,
+                    on_token=on_token,
+                )
+                if on_token is not None and not streamed and text:
+                    on_token(text)
                 return AgentResult(answer=text, notes="", sources=[])
+            msg = (
+                "Saya belum menemukan bukti dari sumber yang tersedia untuk menjawab pertanyaan ini."
+                if indonesian else
+                "I don't know from my sources, and no evidence was found."
+            )
+            if on_token is not None:
+                on_token(msg)
             return AgentResult(
-                answer="I don't know from my sources, and no evidence was found.",
+                answer=msg,
                 notes="no evidence collected",
                 sources=[],
             )
 
+        prompt_question = search_query if search_query != question else question
         evidence = self._format_evidence(sources)
+        fits = getattr(self.engine, "prompt_fits", None)
+        if callable(fits):
+            # Trim excess tail evidence so long web/RAG pages never left-truncate the prompt
+            kept = list(sources)
+            while len(kept) > 1 and not fits(format_prompt(prompt_question, evidence=self._format_evidence(kept)), token_budget):
+                kept.pop()
+            evidence = self._format_evidence(kept)
+            if not fits(format_prompt(prompt_question, evidence=evidence), token_budget):
+                lo, hi = 0, len(evidence)
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    if fits(format_prompt(prompt_question, evidence=evidence[:mid]), token_budget):
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                evidence = evidence[:lo].rstrip()
         notes = ""
         if self.cfg.think:
-            notes = self.engine.complete(
-                NOTES_PROMPT.format(evidence=evidence, question=question),
+            notes, _ = self._complete(
+                NOTES_PROMPT.format(evidence=evidence, question=prompt_question),
                 max_tokens=120,
-            ).strip()
+                temperature=temperature,
+            )
 
-        answer = self.engine.complete(
-            format_prompt(question, evidence=evidence),
-            max_tokens=self.cfg.max_answer_tokens,
-        ).strip()
-        indonesian = bool(_ID_WORDS.search(question))
-        ok, safe_fallback = verify_grounded_answer(question, evidence, answer, indonesian=indonesian)
+        answer, _ = self._complete(
+            format_prompt(prompt_question, evidence=evidence),
+            max_tokens=token_budget,
+            temperature=temperature,
+        )
+        ok, safe_fallback = verify_grounded_answer(prompt_question, evidence, answer, indonesian=indonesian)
+        if not ok:
+            # One bounded grounding retry keeping exact figures and currency symbols from evidence
+            hint = (
+                "Gunakan angka dan mata uang persis seperti pada kutipan bukti, tanpa mengganti satuan."
+                if indonesian else
+                "Use the exact numbers and currency symbols from the evidence without converting currencies."
+            )
+            retry_prompt = format_prompt(f"{prompt_question}\n({hint})", evidence=evidence)
+            if not callable(fits) or fits(retry_prompt, token_budget):
+                retry_ans, _ = self._complete(
+                    retry_prompt,
+                    max_tokens=token_budget,
+                    temperature=0.0,
+                )
+                ok_retry, fb_retry = verify_grounded_answer(question, evidence, retry_ans, indonesian=indonesian)
+                if ok_retry:
+                    answer = retry_ans
+                    ok = True
+                elif fb_retry:
+                    safe_fallback = fb_retry
         if not ok and safe_fallback:
             answer = safe_fallback
+        if on_token is not None and answer:
+            on_token(answer)
 
         return AgentResult(
             answer=answer,

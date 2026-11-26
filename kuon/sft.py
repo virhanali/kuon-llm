@@ -112,7 +112,8 @@ def sft(base_ckpt: str, data_dir: str, *, out_path: str | None = None, steps: in
         eval_interval: int = 0, patience: int = 0,
         block_size: int | None = None, device: str | None = None, seed: int = 0,
         sample_prompt: str = "Tell me a story.", quiet: bool = False,
-        tokenizer_path: str | Path | None = None, business: bool = False) -> dict:
+        tokenizer_path: str | Path | None = None, business: bool = False,
+        grad_checkpoint: bool = False) -> dict:
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     seed_all(seed)
 
@@ -140,6 +141,7 @@ def sft(base_ckpt: str, data_dir: str, *, out_path: str | None = None, steps: in
     is_cuda = device.startswith("cuda")
     model = Transformer(model_cfg).to(device)
     model.load_state_dict(state["model"])
+    model.grad_checkpoint = bool(grad_checkpoint)
     decay = [p for p in model.parameters() if p.requires_grad and p.dim() >= 2]
     no_decay = [p for p in model.parameters() if p.requires_grad and p.dim() < 2]
     opt = torch.optim.AdamW(
