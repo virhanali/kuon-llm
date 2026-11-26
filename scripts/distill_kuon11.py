@@ -623,7 +623,8 @@ def _run_hf_generation(
     max_tokens: int = 780,
     load_in_4bit: bool = False,
 ) -> dict[str, str]:
-    from scripts.distill_gemma4 import generate_batches
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     cached: dict[str, str] = {}
     if cache_path.is_file():
@@ -641,22 +642,75 @@ def _run_hf_generation(
     if not pending:
         return cached
 
+    print(f"[distill-k11] loading {model_id} (4bit={load_in_4bit}) once...", flush=True)
+    tok = AutoTokenizer.from_pretrained(model_id)
+    tok.padding_side = "left"
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
+    kwargs: dict = {"device_map": "auto", "torch_dtype": torch.bfloat16}
+    if load_in_4bit:
+        from transformers import BitsAndBytesConfig
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs).eval()
+    except Exception:
+        from transformers import AutoModelForImageTextToText
+        model = AutoModelForImageTextToText.from_pretrained(model_id, **kwargs).eval()
+
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    chunk_step = max(batch_size * 4, 64)
+    done = len(cached)
     with cache_path.open("a", encoding="utf-8") as f_out:
-        for start in range(0, len(pending), chunk_step):
-            sub = pending[start : start + chunk_step]
-            outs = generate_batches(
-                model_id,
-                [(s["lang"], s["prompt"]) for s in sub],
-                batch_size=batch_size,
-                max_new_tokens=max_tokens,
-                load_in_4bit=load_in_4bit,
-            )
-            for spec, (_, raw) in zip(sub, outs):
+        for start in range(0, len(pending), batch_size):
+            sub = pending[start : start + batch_size]
+            texts = []
+            for s in sub:
+                try:
+                    t = tok.apply_chat_template(
+                        [{"role": "user", "content": s["prompt"]}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=False,
+                    )
+                except TypeError:
+                    try:
+                        t = tok.apply_chat_template(
+                            [{"role": "user", "content": s["prompt"]}],
+                            tokenize=False,
+                            add_generation_prompt=True,
+                        )
+                    except Exception:
+                        t = tok.apply_chat_template(
+                            [{"role": "user", "content": [{"type": "text", "text": s["prompt"]}]}],
+                            tokenize=False,
+                            add_generation_prompt=True,
+                        )
+                texts.append(t)
+            enc = tok(texts, return_tensors="pt", padding=True).to(model.device)
+            in_len = enc["input_ids"].shape[1]
+            with torch.inference_mode():
+                out = model.generate(
+                    **enc,
+                    max_new_tokens=max_tokens,
+                    do_sample=True,
+                    temperature=0.75,
+                    top_p=0.92,
+                    pad_token_id=tok.pad_token_id,
+                )
+            for spec, seq in zip(sub, out):
+                raw = tok.decode(seq[in_len:], skip_special_tokens=True)
                 cached[spec["id"]] = raw
                 f_out.write(json.dumps({"id": spec["id"], "raw": raw}, ensure_ascii=False) + "\n")
             f_out.flush()
+            done += len(sub)
+            if done % max(batch_size * 4, 64) == 0 or done == len(specs):
+                print(f"[distill-k11] progress {done}/{len(specs)}", flush=True)
+    del model
+    torch.cuda.empty_cache()
     return cached
 
 
