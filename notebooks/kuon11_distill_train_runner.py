@@ -1,9 +1,9 @@
-"""End-to-end Colab L4 runner for Kuon 1.1:
+"""End-to-end Kaggle GPU / Colab L4 runner for Kuon 1.1:
 Gemma 4 E4B-IT non-coding distillation -> v4.2 anchor merge -> Stage 3 SFT + APO-zero -> 6-suite eval -> INT8 export.
 
-Saves artifacts privately to:
-  - Dataset: virhanali/kuon11-noncoding-distill-data
-  - Release: virhanali/kuon2-300m-release (new version)
+Works seamlessly on:
+  - Kaggle GPU Kernels (reads /kaggle/input/*, writes final release to /kaggle/working/kuon11-release)
+  - Google Colab L4 (downloads private datasets via KAGGLE_API_TOKEN secret, uploads release to Kaggle)
 """
 
 from __future__ import annotations
@@ -41,20 +41,26 @@ def run(cmd: list[str], *, env=None, cwd=None, log_path: Path | None = None) -> 
             lf.close()
 
 
-def setup_kaggle() -> None:
-    from google.colab import userdata
+def is_kaggle_env() -> bool:
+    return Path("/kaggle/input").is_dir()
 
-    tok = (userdata.get("KAGGLE_API_TOKEN") or "").strip()
-    assert tok, "KAGGLE_API_TOKEN missing in Colab Secrets"
-    os.environ["KAGGLE_API_TOKEN"] = tok
-    kd = Path("/root/.kaggle")
-    kd.mkdir(parents=True, exist_ok=True)
-    p = kd / "access_token"
-    p.write_text(tok + "\n", encoding="utf-8")
-    p.chmod(0o600)
+
+def setup_deps(on_kaggle: bool) -> None:
+    if not on_kaggle:
+        from google.colab import userdata
+
+        tok = (userdata.get("KAGGLE_API_TOKEN") or "").strip()
+        assert tok, "KAGGLE_API_TOKEN missing in Colab Secrets"
+        os.environ["KAGGLE_API_TOKEN"] = tok
+        kd = Path("/root/.kaggle")
+        kd.mkdir(parents=True, exist_ok=True)
+        p = kd / "access_token"
+        p.write_text(tok + "\n", encoding="utf-8")
+        p.chmod(0o600)
     run([
         sys.executable, "-m", "pip", "install", "-q", "-U",
-        "transformers", "accelerate", "bitsandbytes", "kaggle", "tokenizers", "datasets", "six", "regex",
+        "transformers", "accelerate", "bitsandbytes", "tokenizers", "datasets", "six", "regex",
+        *([] if on_kaggle else ["kaggle"]),
     ])
 
 
@@ -80,38 +86,59 @@ def dl(slug: str, dest: Path, files: list[str] | None = None) -> None:
         run(["kaggle", "datasets", "download", "-d", slug, "-p", str(dest), "--unzip", "--force"])
 
 
+def find_input_file(filename: str) -> Path:
+    for match in Path("/kaggle/input").rglob(filename):
+        if match.is_file():
+            return match
+    raise FileNotFoundError(f"{filename} not found under /kaggle/input")
+
+
 def main() -> None:
     import torch
 
     assert torch.cuda.is_available(), "No GPU detected"
+    on_kaggle = is_kaggle_env()
     vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    print(f"[kuon11] GPU={torch.cuda.get_device_name(0)} ({vram_gb:.1f} GB)", flush=True)
-    setup_kaggle()
+    print(
+        f"[kuon11] env={'kaggle' if on_kaggle else 'colab'} "
+        f"GPU={torch.cuda.get_device_name(0)} ({vram_gb:.1f} GB, bf16={torch.cuda.is_bf16_supported()})",
+        flush=True,
+    )
+    setup_deps(on_kaggle)
 
-    repo = Path("/content/kuon-repo")
+    work_root = Path("/kaggle/working") if on_kaggle else Path("/content")
+    repo = work_root / "kuon-repo"
     if repo.exists():
         shutil.rmtree(repo)
-    dl("virhanali/kuon-code-latest", repo)
-    for tf_path in list(repo.glob("*.tar")):
-        with tarfile.open(tf_path) as tf:
+    repo.mkdir(parents=True, exist_ok=True)
+
+    if on_kaggle:
+        code_tar = find_input_file("kuon-code.tar")
+        with tarfile.open(code_tar) as tf:
             tf.extractall(repo)
-        tf_path.unlink()
-    assert (repo / "scripts/distill_kuon11.py").is_file()
+        base = find_input_file("kuon-2-loop-best.pt")
+        tok_path = find_input_file("tokenizer.json")
+        v42_dir = find_input_file("sft_train.jsonl").parent
+    else:
+        dl("virhanali/kuon-code-latest", repo)
+        for tf_path in list(repo.glob("*.tar")):
+            with tarfile.open(tf_path) as tf:
+                tf.extractall(repo)
+            tf_path.unlink()
+        s2_dir = work_root / "kuon2-s2-ckpt"
+        dl("virhanali/kuon2-300m-stage2-ckpts", s2_dir, ["kuon-2-loop-best.pt", "tokenizer.json"])
+        base = s2_dir / "kuon-2-loop-best.pt"
+        tok_path = s2_dir / "tokenizer.json"
+        v42_dir = work_root / "kuon2-stage3-v42-data"
+        if v42_dir.exists():
+            shutil.rmtree(v42_dir)
+        dl(
+            "virhanali/kuon2-stage3-v42-data", v42_dir,
+            ["sft_train.jsonl", "sft_val.jsonl", "prefs_train.jsonl", "prefs_val.jsonl"],
+        )
 
-    s2_dir = Path("/content/kuon2-s2-ckpt")
-    dl("virhanali/kuon2-300m-stage2-ckpts", s2_dir, ["kuon-2-loop-best.pt", "tokenizer.json"])
-    base = s2_dir / "kuon-2-loop-best.pt"
-    tok_path = s2_dir / "tokenizer.json"
-
-    v42_dir = Path("/content/kuon2-stage3-v42-data")
-    if v42_dir.exists():
-        shutil.rmtree(v42_dir)
-    dl(
-        "virhanali/kuon2-stage3-v42-data", v42_dir,
-        ["sft_train.jsonl", "sft_val.jsonl", "prefs_train.jsonl", "prefs_val.jsonl"],
-    )
-
-    dist_dir = Path("/content/kuon11-distill-data")
+    assert (repo / "scripts/distill_kuon11.py").is_file(), "distill_kuon11.py missing in repo"
+    dist_dir = work_root / "kuon11-distill-data"
     dist_dir.mkdir(parents=True, exist_ok=True)
     env = {**os.environ, "PYTHONPATH": str(repo), "MKL_THREADING_LAYER": "GNU"}
 
@@ -130,35 +157,24 @@ def main() -> None:
         "--merge-base-dir", str(v42_dir),
         "--tokenizer", str(tok_path),
         "--block-size", "1024",
+        "--load-in-4bit",
     ]
-    try:
-        run(base_cmd + ["--load-in-4bit", "--batch-size", "16"], cwd=str(repo), env=env)
-    except subprocess.CalledProcessError:
-        print("[kuon11] Retrying distillation with --load-in-4bit --batch-size 8...", flush=True)
-        run(base_cmd + ["--load-in-4bit", "--batch-size", "8"], cwd=str(repo), env=env)
+    bs_candidates = ["16", "8", "4"] if vram_gb >= 20.0 else ["8", "4", "2"]
+    distill_ok = False
+    for bs in bs_candidates:
+        try:
+            run(base_cmd + ["--batch-size", bs], cwd=str(repo), env=env)
+            distill_ok = True
+            break
+        except subprocess.CalledProcessError:
+            print(f"[kuon11] distillation failed at batch-size={bs}, retrying smaller batch...", flush=True)
+            torch.cuda.empty_cache()
+    assert distill_ok, "Distillation failed across all batch sizes"
 
-    # Free teacher VRAM before Stage 3 training
     torch.cuda.empty_cache()
 
-    # Backup distilled dataset privately to Kaggle (excluding raw_cache.jsonl if huge, keep clean splits)
-    ds_pkg = Path("/content/kuon11-kaggle-ds")
-    if ds_pkg.exists():
-        shutil.rmtree(ds_pkg)
-    ds_pkg.mkdir(parents=True)
-    for fn in ("sft_train.jsonl", "sft_val.jsonl", "prefs_train.jsonl", "prefs_val.jsonl"):
-        shutil.copy2(dist_dir / fn, ds_pkg / fn)
-    (ds_pkg / "dataset-metadata.json").write_text(json.dumps({
-        "title": "Kuon 1.1 Non-Coding Gemma4 Distilled Data",
-        "id": "virhanali/kuon11-noncoding-distill-data",
-        "licenses": [{"name": "other"}],
-    }))
-    r = subprocess.run(["kaggle", "datasets", "create", "-p", str(ds_pkg)], capture_output=True, text=True)
-    if r.returncode != 0:
-        run(["kaggle", "datasets", "version", "-p", str(ds_pkg), "-m", "Kuon 1.1 non-coding Gemma4-E4B + v4.2 anchor"])
-    print("[kuon11] Backed up private dataset virhanali/kuon11-noncoding-distill-data", flush=True)
-
     # Step 2: Stage 3 SFT + APO-zero (proven v4.2 beta=1.0, sft_weight=0.35 recipe)
-    s3_out = Path("/content/kuon11-stage3-out")
+    s3_out = work_root / "kuon11-stage3-out"
     if s3_out.exists():
         shutil.rmtree(s3_out)
     s3_out.mkdir(parents=True, exist_ok=True)
@@ -173,8 +189,8 @@ def main() -> None:
         "--beta", "1.0", "--sft-weight", "0.35", "--grad-checkpoint",
     ], cwd=str(repo), env=env, log_path=s3_log)
 
-    # Step 3: Upload Kuon 1.1 release artifacts to Private Kaggle
-    rel = Path("/content/kaggle-release-kuon11")
+    # Step 3: Package clean release artifacts
+    rel = work_root / "kuon11-release"
     if rel.exists():
         shutil.rmtree(rel)
     rel.mkdir(parents=True)
@@ -184,6 +200,9 @@ def main() -> None:
             shutil.copy2(ck3 / fn, rel / fn)
     if not (rel / "tokenizer.json").is_file():
         shutil.copy2(tok_path, rel / "tokenizer.json")
+    for fn in ("sft_train.jsonl", "sft_val.jsonl", "prefs_train.jsonl", "prefs_val.jsonl"):
+        if (dist_dir / fn).is_file():
+            shutil.copy2(dist_dir / fn, rel / fn)
     if s3_log.is_file():
         shutil.copy2(s3_log, rel / "stage3_run.log")
     ev = s3_out / "eval"
@@ -199,19 +218,45 @@ def main() -> None:
     ):
         if (ev / src_rel).is_file():
             shutil.copy2(ev / src_rel, rel / dst_name)
-    with tarfile.open(rel / "eval_all.tar.gz", "w:gz") as tf:
-        tf.add(ev, arcname="eval")
-    (rel / "dataset-metadata.json").write_text(json.dumps({
-        "title": "Kuon-2 300M Release Artifacts",
-        "id": "virhanali/kuon2-300m-release",
-        "licenses": [{"name": "other"}],
-    }))
-    run([
-        "kaggle", "datasets", "version", "-p", str(rel),
-        "-m", "Kuon 1.1 Non-Coding Gemma4-E4B Distilled + v4.2 Anchor (2400 SFT + 700 APO-zero + INT8)",
-        "-r", "tar",
-    ])
-    print("\n[kuon11] ALL DONE!", flush=True)
+    if ev.is_dir():
+        with tarfile.open(rel / "eval_all.tar.gz", "w:gz") as tf:
+            tf.add(ev, arcname="eval")
+
+    if on_kaggle:
+        # Clean bulky intermediates so Kaggle working dir output stays crisp & fast to download
+        for tmp_dir in (repo, s3_out, dist_dir):
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+        print(f"\n[kuon11] ALL DONE! Saved release artifacts in {rel}", flush=True)
+    else:
+        # Upload distilled dataset & release to Private Kaggle from Colab
+        ds_pkg = work_root / "kuon11-kaggle-ds"
+        if ds_pkg.exists():
+            shutil.rmtree(ds_pkg)
+        ds_pkg.mkdir(parents=True)
+        for fn in ("sft_train.jsonl", "sft_val.jsonl", "prefs_train.jsonl", "prefs_val.jsonl"):
+            if (rel / fn).is_file():
+                shutil.copy2(rel / fn, ds_pkg / fn)
+        (ds_pkg / "dataset-metadata.json").write_text(json.dumps({
+            "title": "Kuon 1.1 Non-Coding Gemma4 Distilled Data",
+            "id": "virhanali/kuon11-noncoding-distill-data",
+            "licenses": [{"name": "other"}],
+        }))
+        r = subprocess.run(["kaggle", "datasets", "create", "-p", str(ds_pkg)], capture_output=True, text=True)
+        if r.returncode != 0:
+            run(["kaggle", "datasets", "version", "-p", str(ds_pkg), "-m", "Kuon 1.1 non-coding Gemma4-E4B + v4.2 anchor"])
+
+        (rel / "dataset-metadata.json").write_text(json.dumps({
+            "title": "Kuon-2 300M Release Artifacts",
+            "id": "virhanali/kuon2-300m-release",
+            "licenses": [{"name": "other"}],
+        }))
+        run([
+            "kaggle", "datasets", "version", "-p", str(rel),
+            "-m", "Kuon 1.1 Non-Coding Gemma4-E4B Distilled + v4.2 Anchor (2400 SFT + 700 APO-zero + INT8)",
+            "-r", "tar",
+        ])
+        print("\n[kuon11] ALL DONE!", flush=True)
 
 
 if __name__ == "__main__":

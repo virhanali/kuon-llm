@@ -642,18 +642,20 @@ def _run_hf_generation(
     if not pending:
         return cached
 
-    print(f"[distill-k11] loading {model_id} (4bit={load_in_4bit}) once...", flush=True)
+    compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    print(f"[distill-k11] loading {model_id} (4bit={load_in_4bit}, dtype={compute_dtype}) once...", flush=True)
     tok = AutoTokenizer.from_pretrained(model_id)
     tok.padding_side = "left"
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    kwargs: dict = {"device_map": "auto", "torch_dtype": torch.bfloat16}
+    kwargs: dict = {"device_map": "auto", "torch_dtype": compute_dtype}
     if load_in_4bit:
         from transformers import BitsAndBytesConfig
         kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=compute_dtype,
         )
 
     try:
