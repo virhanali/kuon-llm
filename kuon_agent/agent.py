@@ -36,8 +36,9 @@ _TOOL_CALL_RE = re.compile(
 )
 _ID_WORDS = re.compile(
     r"\b(?:apa|apakah|siapa|kapan|dimana|mengapa|kenapa|bagaimana|berapa|berikut|sekarang|adalah|"
-    r"dengan|untuk|tidak|bisa|sudah|belum|saya|anda|kamu|biaya|bulan|dari|harga|hitung|hpp|kami|"
-    r"ke|kotor|minggu|omzet|omset|pendapatan|persen|pesanan|turun|yang)\b",
+    r"dengan|untuk|tidak|bisa|sudah|belum|saya|aku|anda|kamu|ku|biaya|bisnis|bisnisku|bulan|cabang|"
+    r"dari|harga|hitung|hpp|jualan|kami|ke|kotor|laba|lesu|minggu|modal|omzet|omset|pelanggan|"
+    r"pendapatan|penjualan|persen|pesanan|produk|rugi|sepi|stok|toko|turun|untung|yang)\b",
     re.I,
 )
 _CHANGE_TERMS = re.compile(
@@ -278,11 +279,53 @@ Question: {question}
 Bullet points:"""
 
 
+_IDENTITY_PATTERNS = [
+    re.compile(
+        r"\b(who are you|what is kuon|who is kuon|tell me about yourself|"
+        r"apa itu kuon|siapa kamu|kamu siapa|siapa anda|anda siapa|"
+        r"siapa (?:yang )?(?:membuatmu|buat kamu|bikin kamu|mengembangkanmu|develop kamu)|"
+        r"siapa (?:pembuatmu|penciptamu|developermu|pembuat kamu|developer kamu)|"
+        r"(?:kamu|anda|kuon)\s+(?:itu\s+)?(?:didevelop|di-?develop|dikembangkan|dibuat|dibikin|diciptakan)\s+(?:sama|oleh)\s+siapa|"
+        r"(?:buatan|bikinan|karya|developer|pencipta)\s+siapa(?:\s+(?:kamu|anda|kuon|ini))?|"
+        r"who (?:made|built|created|developed|trained) you|who is your (?:creator|developer|maker))\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(dasarnya model apa|pakai model apa|pake model apa|berbasis (?:model |llm )?apa|model dasarmu|"
+        r"what (?:base )?(?:model|llm|ai) are you|which (?:base )?(?:model|llm|ai) are you|"
+        r"built on|based on (?:gpt|chatgpt|openai|claude|anthropic|gemma|gemini|llama|qwen|deepseek|mistral))\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:model|llm|ai)\s+(?:(?:llm|ai)\s+)?apa(?:\s+(?:sih|nih|ya|yah))?\s+(?:kamu|anda|kau|lu|lo|elu|kuon|ini)\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:kamu|anda|kau|lu|lo|elu|kuon|ini)\s+(?:itu\s+)?(?:pakai\s+|pake\s+)?(?:model|llm|ai)\s+(?:(?:llm|ai)\s+)?apa\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:apakah\s+)?(?:kamu|anda|kau|lu|lo|kuon)\s+(?:itu\s+)?(?:pakai|pake|berbasis|dari|adalah|turunan)?\s*"
+        r"(?:gpt|chatgpt|openai|claude|anthropic|gemma|gemini|llama|qwen|deepseek|mistral)\b",
+        re.I,
+    ),
+    re.compile(
+        r"\bare\s+you\s+(?:a\s+)?(?:based\s+on\s+|built\s+on\s+|powered\s+by\s+|using\s+)?"
+        r"(?:gpt|chatgpt|openai|claude|anthropic|gemma|gemini|llama|qwen|deepseek|mistral)\b",
+        re.I,
+    ),
+]
+
+_REACTION_RE = re.compile(
+    r"^(?:he+he+|ha+ha+|hi+hi+|wk+w[wk]*|kw+k[kw]*|lol+|lmao|oke+|ok+|sip+|siap+|mantap+|keren+|nice+|cool+|good|ya+|iya+|betul|bener|cuy)[!.,?\s]*$",
+    re.I,
+)
+
 SMALLTALK_PATTERNS = [
     re.compile(r"^(halo+|hallo+|hai+|hi+|hello+|hey+|selamat\s+(pagi|siang|sore|malam)|good\s+(morning|afternoon|evening)|assalamualaikum)\b", re.I),
+    _REACTION_RE,
     re.compile(r"\b(thank you|thanks|terima kasih|makasih)\b", re.I),
-    re.compile(r"\b(who are you|what is kuon|who is kuon|tell me about yourself|apa itu kuon|siapa kamu|siapa yang membuatmu|who made you|who built you)\b", re.I),
-    re.compile(r"\b(dasarnya model apa|pakai model apa|berbasis (?:model )?apa|model dasarmu|what (?:base )?model are you|built on|based on (?:gpt|claude|gemma|llama|qwen))\b", re.I),
+    *_IDENTITY_PATTERNS,
     re.compile(r"\b(tell me|write|tulis|ceritakan)\b.{0,40}\b(story|cerita)\b", re.I),
 ]
 
@@ -292,20 +335,276 @@ _GREETING_PREFIX_RE = re.compile(
     re.I,
 )
 
+_ID_IDENTITY_HINT_RE = re.compile(
+    r"\b(?:kamu|anda|kau|lu|lo|elu|apa|siapa|pakai|pake|dasar|dasarnya|berbasis|ini|pembuatmu|membuatmu)\b",
+    re.I,
+)
+
+
+def _clean_source_label(source: str) -> str:
+    """Strip internal filesystem directory paths from local RAG source labels."""
+    s = (source or "").strip()
+    if ("/" in s or "\\" in s) and not s.startswith(("http://", "https://")):
+        name = s.replace("\\", "/").rsplit("/", 1)[-1]
+        return name or s
+    return s
+
+
+_ATTACHMENT_RE = re.compile(
+    r"\[Attachment:\s*([^\]\n]{1,160})\]\s*\n(.*?)\n\[/Attachment\]\s*",
+    re.S,
+)
+_SUMMARY_REQUEST_RE = re.compile(
+    r"\b(?:ringkas(?:kan|an)?|rangkum(?:kan|an)?|ikhtisar|poin\s+utama|isi\s+utama|cek\s+angka\s+utama|"
+    r"summari[sz]e|summary|key\s+points?|main\s+points?|overview|tl;?dr)\b",
+    re.I,
+)
+_METRIC_LINE_RE = re.compile(
+    r"(?:Rp\.?\s*\d|\$\s*\d|\b\d+(?:[.,]\d+)?\s*(?:%|ms|s\b|detik|menit|jam|hari|rps|qps|mb|gb|kb|juta|jt|miliar|ribu|rb|unit|order|req|x\b))",
+    re.I,
+)
+
+
+def _extract_attachments(text: str) -> tuple[list[tuple[str, str]], str]:
+    """Extract `[Attachment: name]...[/Attachment]` blocks and return `(attachments, remainder)`."""
+    attachments: list[tuple[str, str]] = []
+    for m in _ATTACHMENT_RE.finditer(text):
+        name = _clean_source_label(m.group(1).strip()) or "document"
+        body = m.group(2).strip()
+        if body:
+            attachments.append((name, body))
+    remainder = _ATTACHMENT_RE.sub("", text).strip()
+    return attachments, remainder
+
+
+def _summarize_attached_document(filename: str, body: str, indonesian: bool) -> AgentResult:
+    """Build a 100% grounded extractive overview of an uploaded document or table."""
+    tbl = _extract_embedded_table(body)
+    if tbl is not None:
+        try:
+            summary = summarize_table(tbl)
+            num_stats = summary.get("numeric_summary") or {}
+            if num_stats:
+                lines_out: list[str] = []
+                header = (
+                    f"Ringkasan tabel {filename} ({summary['row_count']} baris):"
+                    if indonesian else
+                    f"Table summary for {filename} ({summary['row_count']} rows):"
+                )
+                lines_out.append(header)
+                for col, st in num_stats.items():
+                    total_txt = _format_num(st["sum"], indonesian)
+                    avg_txt = _format_num(st["mean"], indonesian)
+                    min_txt = _format_num(st["min"], indonesian)
+                    max_txt = _format_num(st["max"], indonesian)
+                    if indonesian:
+                        line = f"- {col}: total {total_txt}, rata-rata {avg_txt}, terendah {min_txt}, tertinggi {max_txt}"
+                        if "first_to_last_pct" in st:
+                            line += f" (perubahan awal ke akhir: {_format_num(st['first_to_last_pct'], True)}%)"
+                    else:
+                        line = f"- {col}: total {total_txt}, avg {avg_txt}, min {min_txt}, max {max_txt}"
+                        if "first_to_last_pct" in st:
+                            line += f" (first-to-last change: {_format_num(st['first_to_last_pct'], False)}%)"
+                    lines_out.append(line)
+                note = f"table_summary(file={filename}, rows={summary['row_count']}, cols={len(num_stats)})"
+                return AgentResult(answer="\n".join(lines_out), notes=note, sources=[])
+        except ValueError:
+            pass
+
+    raw_lines = [ln.rstrip() for ln in body.splitlines()]
+    in_code = False
+    title = ""
+    headings: list[str] = []
+    key_points: list[str] = []
+    metric_points: list[str] = []
+    seen: set[str] = set()
+
+    for ln in raw_lines:
+        s = ln.strip()
+        if s.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code or not s:
+            continue
+        if re.fullmatch(r"[-=*_]{3,}", s):
+            continue
+        if s.startswith("#"):
+            clean_h = re.sub(r"^#+\s*", "", s).strip(" *`")
+            if not clean_h:
+                continue
+            if not title and s.startswith("# "):
+                title = clean_h
+            elif clean_h not in headings and len(headings) < 6:
+                headings.append(clean_h)
+            continue
+        if s.startswith("|") and s.endswith("|"):
+            continue
+        clean = re.sub(r"^[\-\*\+•]\s+|\d+[.)]\s+", "", s)
+        clean = re.sub(r"`([^`]+)`", r"\1", clean)
+        clean = re.sub(r"\*\*([^*]+)\*\*", r"\1", clean)
+        clean = re.sub(r"\s+", " ", clean).strip()
+        if len(clean) < 20:
+            continue
+        if len(clean) > 190:
+            clean = clean[:187].rsplit(" ", 1)[0].rstrip(".,;:") + "…"
+        norm = clean.casefold()
+        if norm in seen:
+            continue
+        seen.add(norm)
+        if _METRIC_LINE_RE.search(clean) and len(metric_points) < 4:
+            metric_points.append(clean)
+        elif len(key_points) < 4:
+            key_points.append(clean)
+
+    out: list[str] = []
+    doc_label = f"{title} ({filename})" if title else filename
+    out.append(
+        f"Ringkasan dokumen: {doc_label}"
+        if indonesian else
+        f"Document summary: {doc_label}"
+    )
+    if headings:
+        sec_label = "Bagian utama" if indonesian else "Main sections"
+        out.append(f"{sec_label}: " + ", ".join(headings[:5]) + ".")
+    if key_points:
+        out.append("\nPoin utama:" if indonesian else "\nKey points:")
+        for pt in key_points[:4]:
+            out.append(f"- {pt}")
+    if metric_points:
+        out.append("\nAngka dan target tercatat:" if indonesian else "\nKey numbers and targets:")
+        for mp in metric_points[:4]:
+            out.append(f"- {mp}")
+    elif not key_points:
+        snippet = " ".join(ln.strip() for ln in raw_lines if ln.strip())[:260]
+        if snippet:
+            out.append(f"\n- {snippet}")
+
+    out.append(
+        "\nTanyakan bagian spesifik mana pun dari dokumen ini jika ingin dicek lebih detail."
+        if indonesian else
+        "\nAsk a specific question about any section of this document to inspect it further."
+    )
+    note = f"document_extract(file={filename}, headings={len(headings)}, metrics={len(metric_points)}, chars={len(body)})"
+    return AgentResult(answer="\n".join(out), notes=note, sources=[])
+
+
+_CAPABILITY_PATTERNS = [
+    re.compile(
+        r"\b(?:skill\s+apa(?:\s+aja|\s+saja)?(?:\s+yang)?\s+(?:kamu|anda|kuon)|"
+        r"(?:kamu|anda|kuon)\s+(?:punya\s+)?(?:skill|kemampuan|fitur|kelebihan)\s+apa|"
+        r"(?:apa\s+(?:aja|saja)\s+)?(?:kemampuan|kelebihan|fitur|skill)(?:mu|\s+kamu|\s+anda|\s+kuon)|"
+        r"(?:kamu|anda|kuon)\s+bisa\s+(?:bantu\s+)?apa(?:\s+aja|\s+saja)?|"
+        r"apa\s+(?:aja\s+|saja\s+)?yang\s+bisa\s+(?:kamu|anda|kuon)\s+(?:lakukan|kerjakan|bantu)|"
+        r"bisa\s+bantu\s+apa(?:\s+aja|\s+saja)?|"
+        r"what\s+can\s+you\s+do|what\s+are\s+your\s+(?:skills|capabilities|features)|how\s+can\s+you\s+help)\b",
+        re.I,
+    ),
+]
+
+_OPEN_SYMPTOM_RE = re.compile(
+    r"\b(?:lesu|sepi|anjlok|seret|merosot|turun|rugi|boncos|macet|stagnan|susah\s+laku|kurang\s+laku|"
+    r"slow|down|dropping|declining|struggling|losing\s+money|low\s+sales)\b",
+    re.I,
+)
+_BIZ_CONTEXT_RE = re.compile(
+    r"\b(?:bisnis|bisnisku|usaha|usahaku|toko|tokoku|warung|kafe|cafe|resto|restoran|omzet|omset|"
+    r"penjualan|jualan|dagangan|order|pesanan|pelanggan|customer|business|store|shop|sales|revenue)\b",
+    re.I,
+)
+
+
+def is_capability_question(question: str) -> bool:
+    """Detect direct questions asking what Kuon 1 can do / what skills it has."""
+    q = question.strip()
+    if not q or len(q) > 140 or _extract_embedded_table(q) is not None:
+        return False
+    return any(pattern.search(q) for pattern in _CAPABILITY_PATTERNS)
+
+
+def _capability_answer(indonesian: bool) -> AgentResult:
+    if indonesian:
+        text = (
+            "Saya Kuon 1, model bahasa 295,8 juta parameter yang dilatih dari nol. Hal yang bisa saya bantu:\n"
+            "- Cek tabel penjualan (CSV, TSV, atau Markdown) dan hitung total, rata-rata, tertinggi/terendah, porsi persen, serta perubahan antar periode dengan rumus pasti.\n"
+            "- Hitung KPI bisnis seperti gross margin, net margin, titik impas (break-even), AOV, conversion rate, dan ROI.\n"
+            "- Ringkas serta jawab pertanyaan spesifik dari file lampiran (.md, .txt, .csv, .tsv, .json).\n"
+            "- Cari fakta atau berita terbaru lewat web beserta tautan sumbernya di mode General QA.\n"
+            "- Mengaku terus terang saat data belum cukup, tanpa mengarang angka."
+        )
+    else:
+        text = (
+            "I am Kuon 1, a 295.8M-parameter language model trained from scratch. Here is what I can help with:\n"
+            "- Read sales tables (CSV, TSV, or Markdown) and compute totals, averages, min/max, percentage shares, and period-over-period changes with exact formulas.\n"
+            "- Calculate business KPIs including gross margin, net margin, break-even units, AOV, conversion rate, and ROI.\n"
+            "- Summarize and answer specific questions from attached files (.md, .txt, .csv, .tsv, .json).\n"
+            "- Look up current facts from live web sources with citations in General QA mode.\n"
+            "- Say clearly when required data is missing instead of guessing."
+        )
+    return AgentResult(answer=text, notes="", sources=[])
+
+
+def _open_business_symptom_clarify(text: str, indonesian: bool) -> AgentResult | None:
+    """When a user shares an open business problem with no numbers yet, ask concrete diagnostic data."""
+    q = text.strip()
+    if not q or len(q) > 160:
+        return None
+    if _AMOUNT_TOKEN_RE.search(q) or _extract_embedded_table(q) is not None:
+        return None
+    if not (_OPEN_SYMPTOM_RE.search(q) and _BIZ_CONTEXT_RE.search(q)):
+        return None
+    if indonesian:
+        msg = (
+            "Supaya saya bisa bantu cek sumber masalahnya berdasarkan data nyata (bukan tebakan), "
+            "bisa bagikan dulu:\n"
+            "1. Omzet 2 periode terakhir (misalnya minggu lalu dan minggu ini, atau bulan lalu dan bulan ini).\n"
+            "2. Bagian mana yang paling terasa turun: jumlah pengunjung/chat masuk, jumlah transaksi, atau nilai per pesanan?\n\n"
+            "Kamu juga bisa langsung tempel atau unggah tabel penjualan CSV/TSV di sini."
+        )
+    else:
+        msg = (
+            "So I can help diagnose this from real numbers instead of guessing, could you share:\n"
+            "1. Revenue for the last 2 periods (for example last week vs this week, or last month vs this month).\n"
+            "2. Which part dropped most: incoming visitors/leads, completed orders, or average order value?\n\n"
+            "You can also paste or attach a CSV/TSV sales table directly here."
+        )
+    return AgentResult(answer=msg, notes="", sources=[])
+
+
+def is_identity_question(question: str) -> bool:
+    """Detect direct questions about Kuon's identity, model family, or origin."""
+    q = question.strip()
+    if not q or len(q) > 140 or _extract_embedded_table(q) is not None:
+        return False
+    return any(pattern.search(q) for pattern in _IDENTITY_PATTERNS)
+
+
+def _canonical_identity_prompt(question: str) -> str:
+    """Map varied identity phrasings to Kuon 1's trained identity prompt (zero web search)."""
+    q = question.strip()
+    if re.search(r"\b(dasarnya model apa|what base model are you built on)\b", q, re.I):
+        return q
+    if _ID_WORDS.search(q) or _ID_IDENTITY_HINT_RE.search(q):
+        return "Kamu dasarnya model apa?"
+    return "What base model are you built on?"
+
 
 def is_smalltalk(question: str) -> bool:
     """Greetings, thanks, and identity questions are answered directly
     (no search) using the chat template the model was fine-tuned on."""
-    return any(pattern.search(question.strip()) for pattern in SMALLTALK_PATTERNS)
+    q = question.strip()
+    if is_identity_question(q):
+        return True
+    return any(pattern.search(q) for pattern in SMALLTALK_PATTERNS)
 
 
 def _normalize_smalltalk_prompt(question: str) -> str:
-    """Strip leading greeting filler when followed by a direct identity question."""
+    """Strip greeting filler and canonicalize identity prompts for clean generation."""
     q = question.strip()
     stripped = _GREETING_PREFIX_RE.sub("", q).strip()
-    if stripped and is_smalltalk(stripped):
-        return stripped
-    return q
+    candidate = stripped if (stripped and is_smalltalk(stripped)) else q
+    if is_identity_question(candidate):
+        return _canonical_identity_prompt(candidate)
+    return candidate
 
 
 @dataclass
@@ -327,7 +626,11 @@ def _expand_followup_query(question: str, prior_user_msgs: list[str]) -> str:
     q = question.strip()
     if not q or not prior_user_msgs:
         return q
-    prev = next((m.strip() for m in reversed(prior_user_msgs) if m.strip() and not is_smalltalk(m)), "")
+    prev = next(
+        (m.strip() for m in reversed(prior_user_msgs)
+         if m.strip() and not is_smalltalk(m) and not is_capability_question(m)),
+        "",
+    )
     if not prev:
         return q
     # Skip if previous message was a giant pasted table
@@ -476,11 +779,21 @@ def _answer_sales_change(
             break
     if not request:
         return None
-    # If the user moved on to a completely unrelated topic after an earlier sales table, don't hijack it
-    if table_idx is not None and req_idx is not None and table_idx < len(user_msgs) - 1:
-        latest = user_msgs[-1]
-        if _extract_embedded_table(latest) is None and not _AMOUNT_TOKEN_RE.search(latest) and not _SALES_CHANGE_REQUEST.search(latest):
+    latest = user_msgs[-1]
+    latest_has_sales_req = bool(_find_sales_request(latest))
+    # Never let an earlier turn's sales-change question hijack a new table, table-analytics ask, or KPI ask
+    if not latest_has_sales_req:
+        if table_idx is not None and req_idx is not None and table_idx > req_idx:
             return None
+        if any(pat.search(latest) for _, pat in _KPI_REQUEST_PATTERNS):
+            return None
+        if any(pat.search(latest) for _, pat in _TABLE_OP_PATTERNS):
+            return None
+        if table_idx is not None and table_idx < len(user_msgs) - 1:
+            if _extract_embedded_table(latest) is None and not _AMOUNT_TOKEN_RE.search(latest):
+                return None
+            if "?" in latest and not _CHANGE_TERMS.search(latest):
+                return None
 
     def reply(id_text: str, en_text: str) -> AgentResult:
         return AgentResult(id_text if indonesian else en_text)
@@ -929,7 +1242,7 @@ class KuonAgent:
         gathered: list[Source] = []
         if self.cfg.use_rag and self.rag is not None:
             for _score, chunk in self.rag.search(question, top_k=self.cfg.top_k_rag):
-                gathered.append(Source(title=chunk.source, url="", text=chunk.text))
+                gathered.append(Source(title=_clean_source_label(chunk.source), url="", text=chunk.text))
         if self.cfg.use_web:
             gathered.extend(self._web(question, self.cfg.max_sources))
         if self.cfg.use_wiki:
@@ -1047,12 +1360,21 @@ class KuonAgent:
 
         turns: list[list[str]] = []
         user_msgs: list[str] = []
+        raw_user_msgs: list[str] = []
+        attachments: list[tuple[str, str]] = []
         latest_user_text = ""
+        latest_raw_user_text = ""
         for role, content in messages:
             if role == "user":
-                turns.append([f"User: {content}"])
-                user_msgs.append(content)
-                latest_user_text = content
+                att, remainder = _extract_attachments(content)
+                if att:
+                    attachments.extend(att)
+                clean_q = remainder or (content if not att else "")
+                turns.append([f"User: {clean_q or content}"])
+                user_msgs.append(clean_q or content)
+                raw_user_msgs.append(content)
+                latest_user_text = clean_q or content
+                latest_raw_user_text = content
             elif role == "assistant" and turns:
                 turns[-1].append(f"Assistant: {content}")
 
@@ -1066,22 +1388,80 @@ class KuonAgent:
             and any(_ID_WORDS.search(m) for m in user_msgs[:-1])
         )
 
+        # 0. Capability, identity, greetings, and open business symptom diagnostics
+        if not attachments and is_capability_question(latest_user_text):
+            cap_res = _capability_answer(indonesian)
+            if on_token is not None:
+                on_token(cap_res.answer)
+            return cap_res
+
+        if not attachments and _REACTION_RE.fullmatch(latest_user_text.strip()):
+            en_only = bool(re.fullmatch(r"(?:lol+|lmao|nice+|cool+|good)[!.,?\s]*", latest_user_text.strip(), re.I))
+            msg = (
+                "Got it! Whenever you have a table, document, or question to check, just send it over."
+                if en_only and not indonesian else
+                "Siap! Kalau ada tabel, dokumen, atau pertanyaan lain yang mau dicek, langsung kirim saja."
+            )
+            if on_token is not None:
+                on_token(msg)
+            return AgentResult(answer=msg, notes="", sources=[])
+
+        if (
+            not attachments
+            and (is_identity_question(latest_user_text) or is_smalltalk(latest_user_text))
+            and len(latest_user_text.strip()) <= 140
+            and _extract_embedded_table(latest_user_text) is None
+        ):
+            token_budget = min(max_tokens, 512) if max_tokens is not None else self.cfg.max_answer_tokens
+            text, streamed = self._complete(
+                format_prompt(_normalize_smalltalk_prompt(latest_user_text)),
+                max_tokens=token_budget,
+                temperature=temperature,
+                on_token=on_token,
+            )
+            if on_token is not None and not streamed and text:
+                on_token(text)
+            return AgentResult(answer=text, notes="", sources=[])
+
+        if not attachments:
+            symptom_res = _open_business_symptom_clarify(latest_user_text, indonesian)
+            if symptom_res is not None:
+                if on_token is not None:
+                    on_token(symptom_res.answer)
+                return symptom_res
+
         # 1. Deterministic grounded sales-table comparison, table analytics, & direct KPI calculation
-        sales_answer = _answer_sales_change(user_msgs, indonesian)
+        table_search_msgs = [
+            *([body for _, body in attachments]),
+            *raw_user_msgs,
+        ]
+        # Attach latest question to last attached table so table analytics matches queries cleanly
+        analytics_msgs = (
+            [f"{attachments[-1][1]}\n{latest_user_text}"] if attachments else raw_user_msgs
+        )
+        sales_answer = _answer_sales_change(analytics_msgs, indonesian)
         if sales_answer is not None:
             if on_token is not None and sales_answer.answer:
                 on_token(sales_answer.answer)
             return sales_answer
 
-        table_analytics_answer = _answer_table_analytics(user_msgs, indonesian)
+        table_analytics_answer = _answer_table_analytics(analytics_msgs, indonesian)
         if table_analytics_answer is not None:
             if on_token is not None and table_analytics_answer.answer:
                 on_token(table_analytics_answer.answer)
             return table_analytics_answer
 
-        embedded_tbl = _extract_embedded_table(latest_user_text)
+        # Explicit summary request on an uploaded attachment
+        if attachments and _SUMMARY_REQUEST_RE.search(latest_user_text):
+            att_name, att_body = attachments[-1]
+            doc_summary = _summarize_attached_document(att_name, att_body, indonesian)
+            if on_token is not None and doc_summary.answer:
+                on_token(doc_summary.answer)
+            return doc_summary
+
+        embedded_tbl = _extract_embedded_table(latest_raw_user_text)
         if not embedded_tbl:
-            kpi_answer = _answer_direct_kpi(user_msgs, indonesian)
+            kpi_answer = _answer_direct_kpi(table_search_msgs, indonesian)
             if kpi_answer is not None:
                 if on_token is not None and kpi_answer.answer:
                     on_token(kpi_answer.answer)
@@ -1103,14 +1483,29 @@ class KuonAgent:
             except ValueError:
                 pass
 
-        # 2. Optional client document retrieval (only when the operator loaded a RAG index)
-        if self.cfg.use_rag and self.rag is not None and latest_user_text:
+        # 2. Retrieve evidence from user attachments first (never pollute with unrelated KB when files are attached)
+        if attachments:
+            att_index = BM25Index()
+            for att_name, att_body in attachments:
+                att_index.add_text(att_body, source=att_name, max_chars=420, overlap_chars=80)
+            att_index.finalize()
+            rag_query = _expand_followup_query(latest_user_text, user_msgs[:-1])
+            hits = att_index.search(rag_query, top_k=2)
+            if not hits and att_index.chunks:
+                hits = [(1.0, chunk) for chunk in att_index.chunks[:2]]
+            for _score, chunk in hits:
+                snippet = chunk.text[:420].strip()
+                if snippet:
+                    ledger.add(snippet, source=chunk.source)
+                    sources.append({"title": chunk.source, "url": ""})
+        elif self.cfg.use_rag and self.rag is not None and latest_user_text:
             rag_query = _expand_followup_query(latest_user_text, user_msgs[:-1])
             for _score, chunk in self.rag.search(rag_query, top_k=min(2, self.cfg.top_k_rag)):
                 snippet = chunk.text[:350].strip()
                 if snippet:
-                    ledger.add(snippet, source=chunk.source)
-                    sources.append({"title": chunk.source, "url": ""})
+                    label = _clean_source_label(chunk.source)
+                    ledger.add(snippet, source=label)
+                    sources.append({"title": label, "url": ""})
 
         token_budget = min(max_tokens, 512) if max_tokens is not None else min(180, self.cfg.max_answer_tokens)
 
@@ -1211,9 +1606,39 @@ class KuonAgent:
     ) -> AgentResult:
         token_budget = min(max_tokens, 512) if max_tokens is not None else self.cfg.max_answer_tokens
         prior_users = [c for r, c in (history or [])[:-1] if r == "user" and c.strip()]
-        indonesian = bool(_ID_WORDS.search(question)) or (
-            not re.search(r"[A-Za-z]{3,}", question) and any(_ID_WORDS.search(m) for m in prior_users)
+        # If user attached a file in General QA mode, answer from the attachment instead of web search
+        q_atts, q_rem = _extract_attachments(question)
+        hist_atts: list[tuple[str, str]] = []
+        for pm in prior_users:
+            a, _ = _extract_attachments(pm)
+            hist_atts.extend(a)
+        all_atts = hist_atts + q_atts
+        if all_atts and getattr(self.engine, "prompt_fits", None) is not None:
+            conv = list(history or [("user", question)])
+            return self.advise(
+                conv,
+                on_token=on_token,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        indonesian = bool(_ID_WORDS.search(q_rem or question)) or (
+            not re.search(r"[A-Za-z]{3,}", q_rem or question) and any(_ID_WORDS.search(m) for m in prior_users)
         )
+        if is_capability_question(question):
+            cap_res = _capability_answer(indonesian)
+            if on_token is not None:
+                on_token(cap_res.answer)
+            return cap_res
+        if _REACTION_RE.fullmatch(question.strip()):
+            en_only = bool(re.fullmatch(r"(?:lol+|lmao|nice+|cool+|good)[!.,?\s]*", question.strip(), re.I))
+            msg = (
+                "Got it! Whenever you have a table, document, or question to check, just send it over."
+                if en_only and not indonesian else
+                "Siap! Kalau ada tabel, dokumen, atau pertanyaan lain yang mau dicek, langsung kirim saja."
+            )
+            if on_token is not None:
+                on_token(msg)
+            return AgentResult(answer=msg, notes="", sources=[])
         if is_smalltalk(question):
             # answer in the model's own chat format, without search
             text, streamed = self._complete(

@@ -86,6 +86,7 @@ exec "$APP_DIR/venv/bin/python" -m kuon_agent.server \
   --engine kuon \
   --checkpoint "$KUON_CHECKPOINT" \
   --device cpu \
+  --no-think \
   --bind 0.0.0.0 \
   --port "$PORT" \
   "${RAG_ARGS[@]}"
