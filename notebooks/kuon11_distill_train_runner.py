@@ -42,15 +42,17 @@ def run(cmd: list[str], *, env=None, cwd=None, log_path: Path | None = None) -> 
 
 
 def is_kaggle_env() -> bool:
-    return Path("/kaggle/input").is_dir()
+    return bool(os.environ.get("KAGGLE_KERNEL_RUN_TYPE"))
 
 
 def setup_deps(on_kaggle: bool) -> None:
     if not on_kaggle:
-        from google.colab import userdata
+        tok = (os.environ.get("KAGGLE_API_TOKEN") or "").strip()
+        if not tok:
+            from google.colab import userdata
 
-        tok = (userdata.get("KAGGLE_API_TOKEN") or "").strip()
-        assert tok, "KAGGLE_API_TOKEN missing in Colab Secrets"
+            tok = (userdata.get("KAGGLE_API_TOKEN") or "").strip()
+        assert tok, "KAGGLE_API_TOKEN missing in Colab Secrets or environment"
         os.environ["KAGGLE_API_TOKEN"] = tok
         kd = Path("/root/.kaggle")
         kd.mkdir(parents=True, exist_ok=True)
@@ -99,20 +101,21 @@ def main() -> None:
     assert torch.cuda.is_available(), "No GPU detected"
     on_kaggle = is_kaggle_env()
     vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    native_bf16 = torch.cuda.get_device_capability(0)[0] >= 8
     print(
         f"[kuon11] env={'kaggle' if on_kaggle else 'colab'} "
-        f"GPU={torch.cuda.get_device_name(0)} ({vram_gb:.1f} GB, bf16={torch.cuda.is_bf16_supported()})",
+        f"GPU={torch.cuda.get_device_name(0)} ({vram_gb:.1f} GB, native_bf16={native_bf16})",
         flush=True,
     )
     setup_deps(on_kaggle)
 
     work_root = Path("/kaggle/working") if on_kaggle else Path("/content")
     repo = work_root / "kuon-repo"
-    if repo.exists():
-        shutil.rmtree(repo)
-    repo.mkdir(parents=True, exist_ok=True)
 
     if on_kaggle:
+        if repo.exists():
+            shutil.rmtree(repo)
+        repo.mkdir(parents=True, exist_ok=True)
         code_tar = find_input_file("kuon-code.tar")
         with tarfile.open(code_tar) as tf:
             tf.extractall(repo)
@@ -120,11 +123,15 @@ def main() -> None:
         tok_path = find_input_file("tokenizer.json")
         v42_dir = find_input_file("sft_train.jsonl").parent
     else:
-        dl("virhanali/kuon-code-latest", repo)
-        for tf_path in list(repo.glob("*.tar")):
-            with tarfile.open(tf_path) as tf:
-                tf.extractall(repo)
-            tf_path.unlink()
+        if not (repo / "scripts/distill_kuon11.py").is_file():
+            if repo.exists():
+                shutil.rmtree(repo)
+            repo.mkdir(parents=True, exist_ok=True)
+            dl("virhanali/kuon-code-latest", repo)
+            for tf_path in list(repo.glob("*.tar")):
+                with tarfile.open(tf_path) as tf:
+                    tf.extractall(repo)
+                tf_path.unlink()
         s2_dir = work_root / "kuon2-s2-ckpt"
         dl("virhanali/kuon2-300m-stage2-ckpts", s2_dir, ["kuon-2-loop-best.pt", "tokenizer.json"])
         base = s2_dir / "kuon-2-loop-best.pt"

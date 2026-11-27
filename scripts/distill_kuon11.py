@@ -642,7 +642,7 @@ def _run_hf_generation(
     if not pending:
         return cached
 
-    compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    compute_dtype = torch.bfloat16 if torch.cuda.get_device_capability(0)[0] >= 8 else torch.float16
     print(f"[distill-k11] loading {model_id} (4bit={load_in_4bit}, dtype={compute_dtype}) once...", flush=True)
     tok = AutoTokenizer.from_pretrained(model_id)
     tok.padding_side = "left"
